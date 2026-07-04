@@ -1,0 +1,5 @@
+# 強制所有 shell 腳本使用 LF 行尾，避免 Windows 環境 checkout 出 CRLF
+# 導致在 Linux/CI 上 "#!/bin/bash\r -> bad interpreter" 或字串比較失敗。
+*.sh text eol=lf
+*.bash text eol=lf
+.env text eol=lf

@@ -158,6 +158,10 @@ dist
 .yarn/install-state.gz
 .pnp.\*
 
+# Backups
+
+backups/
+
 # wrangler project
 
 .dev.vars*
