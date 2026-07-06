@@ -1,0 +1,56 @@
+name: Promote Pipeline
+
+on:
+  push:
+    branches: ["main"] # 每次合并到 main 分支触发
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm ci
+      - run: npm test
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm ci
+      - name: Deploy Staging
+        env:
+          CLOUDFLARE_ENV: staging
+        run: bash scripts/deploy.sh
+
+  deploy-production:
+    name: Deploy to Production
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production # 触发你在 GitHub 配置的人工审批
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm ci
+      - name: Deploy Production & Rollback on Fail
+        env:
+          CLOUDFLARE_ENV: production
+        run: |
+          # 尝试部署，如果 deploy.sh 返回非 0 失败，则执行 rollback 并在完成后抛出异常
+          bash scripts/deploy.sh || {
+            echo "::error::部署或健康检查失败，正在触发回滚..."
+            bash scripts/rollback.sh
+            exit 1
+          }
