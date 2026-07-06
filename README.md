@@ -6,51 +6,70 @@
 
 ```
 .
-├── .gitattributes        # 強制 *.sh 為 LF 行尾（防 CRLF 在 Linux/CI 上炸）
-├── wrangler.jsonc        # Worker 設定（main 指 src/index.ts；vars 含 ENVIRONMENT/APP_VERSION/HEALTH_MODE）
-├── tsconfig.json         # 型別檢查用（wrangler 以 esbuild 打包，執行不需要）
+├── scripts/
+│   ├── .gitattributes     # 強制 *.sh / .env 為 LF 行尾
+│   ├── utils.sh           # 共用：log / JSON 輸出 / 憑證載入 / 可攜 date
+│   ├── backup.sh          # 備份本地設定 + Cloudflare Zone 路由
+│   ├── deploy.sh          # 部署 + 冒煙測試健康閘門
+│   ├── deploy_check.sh    # 部署前的本地 dev 健康檢查（選用）
+│   ├── rollback.sh        # wrangler 原生回滾 + 設定檔還原
+│   ├── get_metrics.sh     # 查 GraphQL Analytics（requests / error rate / p90）
+│   ├── promote.sh         # 線上版本晉升（從 staging → production）
+│   └── release.sh         # 編排：backup → deploy → 失敗自動 rollback
 ├── src/
-│   └── index.ts          # Worker：GET / 與 GET /health，結構化日誌 + request_metric
-├── utils.sh              # 共用：log / JSON 輸出 / 憑證載入 / 可攜 date
-├── backup.sh             # 備份本地設定 + 雲端 Workers 路由
-├── deploy.sh             # 部署 + 冒煙測試健康閘門
-├── deploy_check.sh       # 部署前的本地 dev 健康檢查（選用）
-├── rollback.sh           # wrangler 原生回滾 + 設定檔還原
-├── get_metrics.sh        # 查 GraphQL Analytics（requests / error rate / p90）
-└── release.sh            # 編排：backup → deploy → 失敗自動 rollback
+│   └── index.ts           # Worker：GET / 與 GET /health，結構化日誌 + request_metric
+├── test/
+│   ├── tsconfig.json      # 測試專用 tsconfig（繼承父層，追加 cloudflare:test 型別）
+│   └── index.spec.ts      # Vitest 測試：/health 200 + 未知路徑 404
+├── wrangler.jsonc         # Worker 設定（vars 含 ENVIRONMENT / APP_VERSION / HEALTH_MODE）
+├── tsconfig.json          # 型別檢查用（wrangler 以 esbuild 打包，執行不需要）
+├── vitest.config.mts      # Vitest 設定（使用 @cloudflare/vitest-pool-workers 的 cloudflareTest）
+├── worker-configuration.d.ts  # wrangler types 自動產生的 binding 型別
+├── .env                   # 環境變數（Cloudflare 憑證等，已 gitignore）
+├── .editorconfig
+├── .prettierrc
+├── AGENTS.md              # 給 AI 助手的專案指引
+└── backups/               # backup.sh 產出的備份目錄
 ```
 
 ## 前置需求
 
 - Node.js + npx（wrangler 透過 npx 呼叫，免全域安裝）
 - jq（腳本以 jq 解析 JSON）
-- TypeScript 型別（供 editor / typecheck；執行由 wrangler esbuild 處理）：
-  `npm i -D wrangler typescript @cloudflare/workers-types`
 - 一個 Cloudflare 帳號；擇一認證：
   - `npx wrangler login`（OAuth，本機開發最簡單），或
   - 環境變數 `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN`（CI 建議）
-- 註：`backup.sh` 的路由匯出與 `get_metrics.sh` 需要 **API token**（上面第二種）。可放進同目錄 `.env`（請保持 LF 行尾）。
+- 註：`backup.sh` 的路由匯出與 `get_metrics.sh` 需要 **API token**（上面第二種）。可放進 `.env`（請保持 LF 行尾）。
 
 ## 快速開始
 
 ```bash
-npm i -D wrangler typescript @cloudflare/workers-types
-npx wrangler dev                  # 本機起 dev → http://localhost:8787/health
-npx tsc --noEmit                  # （選）型別檢查
-bash deploy_check.sh              # （選）另開終端做本地健康檢查
-bash release.sh                   # 一鍵：備份 → 部署 → 健康閘門 → 失敗自動回滾
-bash get_metrics.sh               # 查線上指標
+npm install                   # 安裝依賴（wrangler / typescript / vitest / @cloudflare/workers-types …）
+npm test                      # 跑 Vitest（workerd 隔離環境，驗證 /health 與 404 路由）
+npx wrangler dev              # 本機起 dev → http://localhost:8787/health
+bash scripts/release.sh       # 一鍵：備份 → 部署 → 健康閘門 → 失敗自動回滾
+bash scripts/get_metrics.sh   # 查線上指標
 ```
 
 > 請在專案根目錄執行（`wrangler.jsonc` 與 `./backups` 皆相對於 CWD）。
+
+## 測試
+
+使用 `vitest` + `@cloudflare/vitest-pool-workers`，在 workerd 隔離環境中執行：
+
+```bash
+npm test                      # vitest（自動載入 vitest.config.mts）
+```
+
+測試斷言值直接來自 `wrangler.jsonc` 的 vars（`ENVIRONMENT=development`, `APP_VERSION=v1`），確保測試與部署配置同源。
 
 ## 演練「壞版自動回滾」
 
 失敗注入只在**非 production** 環境生效（`wrangler.jsonc` 預設 `ENVIRONMENT: "development"`，可直接演練）。
 
-1. 先正常發一版：`bash release.sh` → 應通過健康閘門、成功（此為「好版 v1」）。
+1. 先正常發一版：`bash scripts/release.sh` → 應通過健康閘門、成功（此為「好版 v1」）。
 2. 把 `wrangler.jsonc` 的 `HEALTH_MODE` 改成 `"broken"`（此時 `/health` 回 500）。
-3. 再跑 `bash release.sh`：wrangler 上傳「壞版 v2」→ 冒煙測試連續失敗 → **自動觸發 rollback** → 回到 v1（其 vars 為 `HEALTH_MODE: ok`），線上服務恢復。
+3. 再跑 `bash scripts/release.sh`：wrangler 上傳「壞版 v2」→ 冒煙測試連續失敗 → **自動觸發 rollback** → 回到 v1（其 vars 為 `HEALTH_MODE: ok`），線上服務恢復。
 4. 把 `HEALTH_MODE` 改回 `"ok"`，確認狀態一致。
 
 ## 輸出契約
