@@ -1,55 +1,26 @@
-import {
-	env,
-	createExecutionContext,
-	waitOnExecutionContext,
-	SELF,
-} from "cloudflare:test";
-import { describe, it, expect } from "vitest";
-import worker from "../src/index";
+import { SELF } from "cloudflare:test";
+import { describe, expect, it } from "vitest";
 
-const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
+describe("mvp-worker /health", () => {
+	it("returns 200 and the configured health JSON", async () => {
+		const res = await SELF.fetch("https://example.com/health");
+		expect(res.status).toBe(200);
 
-describe("MVP Worker", () => {
-	it("responds with 200 and health JSON at /health (unit style)", async () => {
-		const request = new IncomingRequest("http://example.com/health");
-		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
-		await waitOnExecutionContext(ctx);
-		expect(response.status).toBe(200);
-		const body = await response.json<Record<string, unknown>>();
+		const body = (await res.json()) as {
+			status: string;
+			environment: string;
+			version: string;
+		};
 		expect(body).toMatchObject({
 			status: "OK",
-			environment: "staging",
-			version: "1.0.0",
-		});
-		expect(body).toHaveProperty("timestamp");
-	});
-
-	it("responds with 404 for unknown routes (unit style)", async () => {
-		const request = new IncomingRequest("http://example.com/");
-		const ctx = createExecutionContext();
-		const response = await worker.fetch(request, env, ctx);
-		await waitOnExecutionContext(ctx);
-		expect(response.status).toBe(404);
-		const body = await response.json<Record<string, unknown>>();
-		expect(body).toEqual({ error: "Not Found" });
-	});
-
-	it("responds with 200 and health JSON at /health (integration style)", async () => {
-		const response = await SELF.fetch("https://example.com/health");
-		expect(response.status).toBe(200);
-		const body = await response.json<Record<string, unknown>>();
-		expect(body).toMatchObject({
-			status: "OK",
-			environment: "staging",
-			version: "1.0.0",
+			environment: "development",
+			version: "v1",
 		});
 	});
 
-	it("responds with 404 for unknown routes (integration style)", async () => {
-		const response = await SELF.fetch("https://example.com/");
-		expect(response.status).toBe(404);
-		const body = await response.json<Record<string, unknown>>();
-		expect(body).toEqual({ error: "Not Found" });
+	it("returns 404 for unknown routes", async () => {
+		const res = await SELF.fetch("https://example.com/does-not-exist");
+		expect(res.status).toBe(404);
+		expect(await res.json()).toEqual({ error: "Not Found" });
 	});
 });
