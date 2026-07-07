@@ -1,10 +1,10 @@
 name: Promote Pipeline
 
-# 🚑 動態全域並發鎖：完美的“救護車”機制
+# 動態全域並發鎖：完美的“救護車”機制
 concurrency:
   group: production-deploy
   # 如果手動手動選擇 rollback，值變為 true，立刻強殺線上衝突任務；常規 push/deploy 則為 false，老實排隊
-  cancel-in-progress: ${{ inputs.action == 'rollback' }}
+  cancel-in-progress: ${{ github.event.inputs.action == 'rollback' }}
 
 on:
   push:
@@ -19,6 +19,11 @@ on:
         options:
           - deploy
           - rollback
+      confirm_rollback:
+        description: "【防误触】仅当 action 选 rollback 时，必须输入 YES_ROLLBACK"
+        type: string
+        required: false
+        default: ""
 
 run-name: >-
   ${{ github.event_name == 'workflow_dispatch' && format('Manual {0}', inputs.action) || 'Push to main' }}
@@ -27,7 +32,7 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || inputs.action == 'deploy'
+    if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -40,7 +45,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     environment: staging
-    if: github.event_name == 'push' || inputs.action == 'deploy'
+    if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -58,7 +63,7 @@ jobs:
     needs: deploy-staging
     runs-on: ubuntu-latest
     environment: production # 触发你在 GitHub 配置的人工审批
-    if: github.event_name == 'push' || inputs.action == 'deploy'
+    if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -82,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     # 独立入口，不 needs 任何 job：出事故时回滚不该排在 test/staging 后面，
     # 必须是整条流水线里最快、最少依赖的一条路径。
-    if: github.event_name == 'workflow_dispatch' && inputs.action == 'rollback'
+    if: ${{ github.event.inputs.action == 'rollback' && github.event.inputs.confirm_rollback == 'YES_ROLLBACK' }}
     environment: production-rollback # 与 production 共享 secrets，但不设 required reviewers，保证回滚够快
     steps:
       - uses: actions/checkout@v4
