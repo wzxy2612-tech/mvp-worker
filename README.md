@@ -53,6 +53,14 @@ bash scripts/get_metrics.sh   # 查線上指標
 
 > 請在專案根目錄執行（`wrangler.jsonc` 與 `./backups` 皆相對於 CWD）。
 
+## CI/CD Pipeline
+
+`.github/workflows/deploy.yml` 提供雙路徑發佈：
+
+- **push 到 main** / **手動 deploy** → `test` → `deploy-staging` → `deploy-production`（含人工審批），`deploy.sh` 失敗自動觸發 `rollback.sh`
+- **手動 rollback** → 直接執行 `rollback.sh`，跳過所有前置 job，需在 `confirm_rollback` 填入 `YES_ROLLBACK` 方可觸發（防誤觸）
+- `cancel-in-progress` 在 rollback 觸發時強殺所有排隊中的 deploy 任務
+
 ## 測試
 
 使用 `vitest` + `@cloudflare/vitest-pool-workers`，在 workerd 隔離環境中執行：
