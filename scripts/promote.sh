@@ -66,10 +66,6 @@ else
     log_info "  (指標暫不可用；analytics 有數分鐘延遲，或憑證未設；不影響審批)"
 fi
 
-# 人工審批閘門（本機互動；CI 化時再換自動觀察期）。提示走 stderr，stdout 只留最終 JSON。
-printf '\n>>> STAGING 已就緒：%s\n>>> 確認晉級到 PRODUCTION？輸入 yes 繼續，其它任意鍵放棄： ' "$STAGING_URL" >&2
-read -r APPROVAL
-
 # ---------- 2.5 STAGING 審批閘門 (支援本機與 CI 雙模式) ----------
 # 互動式 TTY（本機）→ 終端機提示，等待輸入 yes/y
 # 非互動式（CI）→ 跳過 read，需顯式傳入 PROMOTE_APPROVE=yes 才放行，否則安全中止

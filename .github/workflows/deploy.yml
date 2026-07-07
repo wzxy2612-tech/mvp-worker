@@ -1,18 +1,31 @@
 name: Promote Pipeline
-
 on:
   push:
     branches: ["main"] # 每次合并到 main 分支触发
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "deploy：走完整流程（test → staging → production）；rollback：跳过 test/staging，直接回滚生产"
+        type: choice
+        required: true
+        default: deploy
+        options:
+          - deploy
+          - rollback
 
-# 新增：确保同一时间只有一个部署流水线在运行
-concurrency: 
+# 确保同一时间只有一个部署流水线在运行
+concurrency:
   group: production-deploy
   cancel-in-progress: false
+
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && format('Manual {0}', inputs.action) || 'Push to main' }}
 
 jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || inputs.action == 'deploy'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -26,13 +39,13 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     environment: staging
+    if: github.event_name == 'push' || inputs.action == 'deploy'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
       - run: npm ci
       - name: Deploy Staging
-
         env:
           CLOUDFLARE_ENV: staging
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -44,6 +57,7 @@ jobs:
     needs: deploy-staging
     runs-on: ubuntu-latest
     environment: production # 触发你在 GitHub 配置的人工审批
+    if: github.event_name == 'push' || inputs.action == 'deploy'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -61,3 +75,22 @@ jobs:
             bash scripts/rollback.sh
             exit 1
           }
+
+  rollback:
+    name: Rollback Production (manual)
+    runs-on: ubuntu-latest
+    # 独立入口，不 needs 任何 job：出事故时回滚不该排在 test/staging 后面，
+    # 必须是整条流水线里最快、最少依赖的一条路径。
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'rollback'
+    environment: production-rollback # 与 production 共享 secrets，但不设 required reviewers，保证回滚够快
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm ci
+      - name: Rollback
+        env:
+          CLOUDFLARE_ENV: production
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash scripts/rollback.sh

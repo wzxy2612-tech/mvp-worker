@@ -1,10 +1,26 @@
 export interface Env {
+	// ==========================================================
+	// 基礎設定與健康閘門變數
+	// ==========================================================
 	ENVIRONMENT: string;
 	APP_VERSION: string;
-	// demo/測試用：值為 "broken" 時讓 /health 回 500，用來演練健康閘門 + 自動回滾。
-	// 僅在非 production 環境生效（見下方判斷），避免誤傷正式環境。
 	HEALTH_MODE?: string;
+
+	// ==========================================================
+	// GitHub CI/CD 控制面變數 (供 /trigger 與 /status 使用)
+	// ==========================================================
+	GITHUB_TOKEN: string;          // PAT (Repo + Workflow scope) 
+	TRIGGER_SECRET: string;        // 呼叫端必須提供的共享密鑰
+	GITHUB_OWNER: string;          // GitHub 組織或使用者名稱
+	GITHUB_REPO: string;           // GitHub 倉庫名稱
+	GITHUB_WORKFLOW_FILE: string;  // Workflow 檔案名稱 (例如: deploy.yml)
 }
+
+// 統一 CORS 標頭，提取到全域以供所有路徑與 Helper 函數使用
+const BASE_HEADERS: Record<string, string> = {
+	'Content-Type': 'application/json',
+	
+};
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -13,54 +29,64 @@ export default {
 		let statusCode = 200;
 		let statusText = "OK";
 
-		// 統一 CORS 標頭，套用到所有回應（原本只加在 /health）。
-		// 註：若需真正的瀏覽器預檢，還要處理 OPTIONS 並加 Allow-Methods/Headers。
-		const baseHeaders: Record<string, string> = {
-			'Content-Type': 'application/json',
-			'Access-Control-Allow-Origin': '*',
-		};
-
 		try {
-			// 1. /health 端點
+			// ==========================================================
+			// 1. /health 端點 (現有探活邏輯)
+			// ==========================================================
 			if (url.pathname === '/health') {
-				// demo 失敗注入：非 production 且 HEALTH_MODE=broken → 回 500
 				if (env.HEALTH_MODE === 'broken' && env.ENVIRONMENT !== 'production') {
 					statusCode = 500;
 					statusText = "Simulated Failure";
 					return new Response(
 						JSON.stringify({ status: 'ERROR', reason: 'simulated failure', version: env.APP_VERSION }),
-						{ status: 500, headers: baseHeaders },
+						{ status: 500, headers: BASE_HEADERS },
 					);
 				}
 
-				const healthData = {
+                             // [新增] 顯式賦值，防禦未來頂部預設值被修改導致的日誌脫節
+				statusCode = 200;
+				statusText = "OK";
+				return json({
 					status: 'OK',
 					timestamp: new Date().toISOString(),
 					environment: env.ENVIRONMENT,
 					version: env.APP_VERSION,
-				};
-				return new Response(JSON.stringify(healthData), {
-					status: 200,
-					headers: baseHeaders,
-				});
+				}, statusCode, statusText);
 			}
 
-			// 2. 其他未定義路徑返回 404
+			// ==========================================================
+			// 2. /trigger 端點 (新增 CI 觸發)
+			// ==========================================================
+			if (url.pathname === '/trigger' && request.method === 'POST') {
+				const res = await handleTrigger(request, env);
+				statusCode = res.status;
+				statusText = res.statusText || "Trigger Processed";
+				return res;
+			}
+
+			// ==========================================================
+			// 3. /status 端點 (新增 CI 狀態查詢)
+			// ==========================================================
+			if (url.pathname === '/status' && request.method === 'GET') {
+				const res = await handleStatus(request, env);
+				statusCode = res.status;
+				statusText = res.statusText || "Status Fetched";
+				return res;
+			}
+
+			// ==========================================================
+			// 4. 其他未定義路徑 (404)
+			// ==========================================================
 			statusCode = 404;
 			statusText = "Not Found";
-			return new Response(JSON.stringify({ error: 'Not Found' }), {
-				status: 404,
-				headers: baseHeaders,
-			});
+			return json({ error: 'Not Found' }, 404, statusText);
 
 		} catch (error: unknown) {
 			statusCode = 500;
 			statusText = "Internal Server Error";
-
-			// 收斂為標準 Error 後再取 message/stack（比 error: any 型別安全）
 			const err = error instanceof Error ? error : new Error(String(error));
 
-			// 結構化異常紀錄：拋出標準 JSON 到 Cloudflare Log Stream
+			// 結構化異常紀錄
 			console.log(JSON.stringify({
 				level: "ERROR",
 				message: err.message,
@@ -68,21 +94,12 @@ export default {
 				timestamp: new Date().toISOString(),
 			}));
 
-			return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
-				status: 500,
-				headers: baseHeaders,
-			});
+			return json({ error: 'Internal Server Error' }, 500, statusText);
 		} finally {
-			// 3. 邊緣原生指標計算：無論如何都會執行
-			//
-			// ⚠ Workers 為防 Spectre，Date.now() 鎖在「上一次 I/O 的時間」，同步執行期間不前進。
-			//   本 handler 無任何 I/O（fetch/KV/D1…），故 duration_ms 在「線上」恆為 ~0；
-			//   本地 wrangler dev（workerd）時鐘照常走，會有非 0 值，屬正常差異。
-			//   → 權威延遲數據請以 Cloudflare Analytics 為準（get_metrics.sh 的 durationP90）。
-			//   → 此欄位僅對未來含 I/O 的路由具測量意義；若不想在正式日誌看到誤導值，可移除。
+			// ==========================================================
+			// 邊緣原生指標計算與結構化日誌輸出 (所有請求皆會經過)
+			// ==========================================================
 			const durationMs = Date.now() - startTime;
-
-			// 強制格式化為結構化指標，供後端 Logpush 或 Dashboard 解析
 			console.log(JSON.stringify({
 				level: "INFO",
 				type: "request_metric",
@@ -96,3 +113,144 @@ export default {
 		}
 	},
 };
+
+// ============================================================================
+// 下方為 GitHub API 控制面輔助函數區 (Helper Functions)
+// ============================================================================
+
+const VALID_ACTIONS = ["deploy", "rollback"] as const;
+type Action = (typeof VALID_ACTIONS)[number];
+
+async function handleTrigger(request: Request, env: Env): Promise<Response> {
+	const authFailure = checkSecret(request, env);
+	if (authFailure) return authFailure;
+
+	let body: { action?: string; ref?: string };
+	try {
+		body = await request.json();
+	} catch {
+		return json({ success: false, message: "invalid JSON body" }, 400, "Bad Request");
+	}
+
+	if (!isValidAction(body.action)) {
+		return json(
+			{ success: false, message: `action must be one of: ${VALID_ACTIONS.join(", ")}` },
+			400, 
+			"Bad Request"
+		);
+	}
+
+	const ref = body.ref ?? "main";
+
+	const res = await ghFetch(
+		env,
+		`/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/workflows/${env.GITHUB_WORKFLOW_FILE}/dispatches`,
+		{
+			method: "POST",
+			body: JSON.stringify({ ref, inputs: { action: body.action } }),
+		}
+	);
+
+	if (res.status === 204) {
+		return json({ success: true, message: `dispatched ${body.action}`, data: { ref } }, 200, "OK");
+	}
+
+	return json(
+		{
+			success: false,
+			message: "GitHub dispatch failed",
+			data: { status: res.status, body: await res.text() },
+		},
+		502,
+		"Bad Gateway"
+	);
+}
+
+async function handleStatus(request: Request, env: Env): Promise<Response> {
+	const authFailure = checkSecret(request, env);
+	if (authFailure) return authFailure;
+
+	const res = await ghFetch(
+		env,
+		`/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/actions/workflows/${env.GITHUB_WORKFLOW_FILE}/runs?per_page=1`
+	);
+	
+	if (!res.ok) {
+		return json({ success: false, message: "failed to fetch runs" }, 502, "Bad Gateway");
+	}
+
+	const data = (await res.json()) as { workflow_runs: GhRun[] };
+	const run = data.workflow_runs[0];
+	
+	if (!run) {
+		return json({ success: true, message: "no runs yet", data: null }, 200, "OK");
+	}
+
+	return json({
+		success: true,
+		data: {
+			run_number: run.run_number,
+			display_title: run.display_title,
+			status: run.status,
+			conclusion: run.conclusion,
+			html_url: run.html_url,
+			created_at: run.created_at,
+			updated_at: run.updated_at,
+		},
+	}, 200, "OK");
+}
+
+interface GhRun {
+	run_number: number;
+	display_title: string;
+	status: string;
+	conclusion: string | null;
+	html_url: string;
+	created_at: string;
+	updated_at: string;
+}
+
+function isValidAction(action?: string): action is Action {
+	return !!action && (VALID_ACTIONS as readonly string[]).includes(action);
+}
+
+function checkSecret(request: Request, env: Env): Response | null {
+	const provided = request.headers.get("X-Trigger-Secret") ?? "";
+	if (!timingSafeEqual(provided, env.TRIGGER_SECRET)) {
+		return json({ success: false, message: "unauthorized" }, 401, "Unauthorized");
+	}
+	return null;
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+	const enc = new TextEncoder();
+	const aBytes = enc.encode(a);
+	const bBytes = enc.encode(b);
+	if (aBytes.length !== bBytes.length) return false;
+	let diff = 0;
+	for (let i = 0; i < aBytes.length; i++) diff |= aBytes[i] ^ bBytes[i];
+	return diff === 0;
+}
+
+async function ghFetch(env: Env, path: string, init: RequestInit = {}): Promise<Response> {
+	return fetch(`https://api.github.com${path}`, {
+		...init,
+		headers: {
+			Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+			Accept: "application/vnd.github+json",
+			"X-GitHub-Api-Version": "2022-11-28",
+			"Content-Type": "application/json",
+			"User-Agent": "mvp-worker-trigger",
+			...(init.headers ?? {}),
+		},
+	});
+}
+
+// 覆寫的 json helper：自動注入全域 BASE_HEADERS 並允許自訂 HTTP Status Code / Text
+function json(payload: unknown, status = 200, statusText = "OK"): Response {
+	return new Response(JSON.stringify(payload), {
+		status,
+		statusText,
+		headers: BASE_HEADERS,
+	});
+}
