@@ -20,8 +20,8 @@
   "vars": {
     "ENVIRONMENT": "development",
     "APP_VERSION": "v1",
-    "HEALTH_MODE": "ok"
-    // 👇 務必把這三行補進來
+    "HEALTH_MODE": "ok",
+    // 務必把這三行補進來
     "GITHUB_OWNER": "wzxy2612-tech",
     "GITHUB_REPO": "mvp-worker",
     "GITHUB_WORKFLOW_FILE": "deploy.yml"
