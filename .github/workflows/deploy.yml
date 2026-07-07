@@ -1,4 +1,11 @@
 name: Promote Pipeline
+
+# 🚑 動態全域並發鎖：完美的“救護車”機制
+concurrency:
+  group: production-deploy
+  # 如果手動手動選擇 rollback，值變為 true，立刻強殺線上衝突任務；常規 push/deploy 則為 false，老實排隊
+  cancel-in-progress: ${{ inputs.action == 'rollback' }}
+
 on:
   push:
     branches: ["main"] # 每次合并到 main 分支触发
