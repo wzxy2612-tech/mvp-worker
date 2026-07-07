@@ -6,8 +6,10 @@
 
 ```
 .
+├── .github/
+│   └── workflows/
+│       └── deploy.yml           # GitHub Actions：雙路徑發佈（deploy / rollback）
 ├── scripts/
-│   ├── .gitattributes     # 強制 *.sh / .env 為 LF 行尾
 │   ├── utils.sh           # 共用：log / JSON 輸出 / 憑證載入 / 可攜 date
 │   ├── backup.sh          # 備份本地設定 + Cloudflare Zone 路由
 │   ├── deploy.sh          # 部署 + 冒煙測試健康閘門
@@ -17,17 +19,21 @@
 │   ├── promote.sh         # 線上版本晉升（從 staging → production）
 │   └── release.sh         # 編排：backup → deploy → 失敗自動 rollback
 ├── src/
-│   └── index.ts           # Worker：GET / 與 GET /health，結構化日誌 + request_metric
+│   └── index.ts           # Worker：GET /health、POST /trigger、GET /status，結構化日誌 + request_metric
 ├── test/
 │   ├── tsconfig.json      # 測試專用 tsconfig（繼承父層，追加 cloudflare:test 型別）
+│   ├── env.d.ts           # 宣告 cloudflare:test 模組擴充 Env
 │   └── index.spec.ts      # Vitest 測試：/health 200 + 未知路徑 404
-├── wrangler.jsonc         # Worker 設定（vars 含 ENVIRONMENT / APP_VERSION / HEALTH_MODE）
+├── wrangler.jsonc         # Worker 設定（vars 含 ENVIRONMENT / APP_VERSION / HEALTH_MODE / GITHUB_*）
 ├── tsconfig.json          # 型別檢查用（wrangler 以 esbuild 打包，執行不需要）
 ├── vitest.config.mts      # Vitest 設定（使用 @cloudflare/vitest-pool-workers 的 cloudflareTest）
 ├── worker-configuration.d.ts  # wrangler types 自動產生的 binding 型別
 ├── .env                   # 環境變數（Cloudflare 憑證等，已 gitignore）
+├── .gitattributes          # 強制 *.sh / .env 為 LF 行尾
 ├── .editorconfig
 ├── .prettierrc
+├── .vscode/
+│   └── settings.json      # 將 wrangler.json 關聯為 JSONC
 ├── AGENTS.md              # 給 AI 助手的專案指引
 └── backups/               # backup.sh 產出的備份目錄
 ```
@@ -105,7 +111,7 @@ Worker 端則以 `console.log(JSON.stringify(...))` 輸出結構化日誌到 Clo
 | `LOCAL_HEALTH_URL` | 本地檢查端點 | `http://localhost:8787/health` |
 | `SCRIPT_NAME` | Worker 名稱（查指標用） | `mvp-worker` |
 
-Worker 的 `wrangler.jsonc` vars：`ENVIRONMENT`（設 `production` 會關閉失敗注入）、`APP_VERSION`、`HEALTH_MODE`（`broken` 觸發 /health 500，僅非 production 生效）。
+Worker 的 `wrangler.jsonc` vars：`ENVIRONMENT`（設 `production` 會關閉失敗注入）、`APP_VERSION`、`HEALTH_MODE`（`broken` 觸發 /health 500，僅非 production 生效）、`GITHUB_OWNER`、`GITHUB_REPO`、`GITHUB_WORKFLOW_FILE`（供 `/trigger` 與 `/status` 路由使用）。
 
 ## 注意事項
 
