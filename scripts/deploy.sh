@@ -77,6 +77,16 @@ MAX_RETRIES="${SMOKE_RETRIES:-3}"       # 單輪容錯重試次數
 RETRY_INTERVAL="${SMOKE_RETRY_GAP:-2}"  # 重試間隔（秒）
 ROUND_GAP="${SMOKE_ROUND_GAP:-5}"       # 輪與輪之間隔（秒）→ 讓「連續穩定」跨越時間
 
+# ==========================================================
+# [新增] 邊緣節點同步熱身延遲 (Smoke Warmup)
+# ==========================================================
+SMOKE_WARMUP="${SMOKE_WARMUP:-5}"       # 預設掛起 5 秒
+if [ "$SMOKE_WARMUP" -gt 0 ]; then
+    log_info "等待 Cloudflare 邊緣節點代碼同步，掛起 ${SMOKE_WARMUP} 秒..."
+    sleep "$SMOKE_WARMUP"
+fi
+# ==========================================================
+
 log_info "啟動邊緣健康驗證：要求連續成功 $MAX_CHECKS 輪（每輪間隔 ${ROUND_GAP}s）..."
 
 HTTP_STATUS="000"

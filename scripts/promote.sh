@@ -38,7 +38,7 @@ log_info "備份完成：${BACKUP_CONFIG_PATH:-<none>}"
 
 # ---------- 1. Phase 1：部署 + 驗證 STAGING ----------
 log_info "[1] 部署並驗證 STAGING（$STAGING_SCRIPT）..."
-STAGING_OUT=$(CLOUDFLARE_ENV=staging bash "$SCRIPT_DIR/deploy.sh")
+STAGING_OUT=$(SMOKE_WARMUP=3 CLOUDFLARE_ENV=staging bash "$SCRIPT_DIR/deploy.sh")
 STAGING_OK=$(jget "$STAGING_OUT" '.success')
 STAGING_ACTION=$(jget "$STAGING_OUT" '.data.required_action')
 
@@ -70,17 +70,31 @@ fi
 printf '\n>>> STAGING 已就緒：%s\n>>> 確認晉級到 PRODUCTION？輸入 yes 繼續，其它任意鍵放棄： ' "$STAGING_URL" >&2
 read -r APPROVAL
 
-if ! [[ "$APPROVAL" =~ ^[yY]([eE][sS])?$ ]]; then
-    log_info "使用者未批准，停在 staging，production 不動。"
-    emit_json_result "true" "Promotion stopped at staging by user (production unchanged)." \
-      "$(jq -cn --arg u "$STAGING_URL" '{stage:"staging_only", staging_url:$u, approved:false}')"
-    exit 0
+# ---------- 2.5 STAGING 審批閘門 (支援本機與 CI 雙模式) ----------
+# 互動式 TTY（本機）→ 終端機提示，等待輸入 yes/y
+# 非互動式（CI）→ 跳過 read，需顯式傳入 PROMOTE_APPROVE=yes 才放行，否則安全中止
+if [ -t 0 ]; then
+    printf '\n>>> STAGING 已就緒：%s\n>>> 確認晉級到 PRODUCTION？輸入 yes 繼續，其它任意鍵放棄： ' "$STAGING_URL" >&2
+    read -r APPROVAL
+    if ! [[ "$APPROVAL" =~ ^[yY]([eE][sS])?$ ]]; then
+        log_info "使用者未批准，停在 staging，production 不動。"
+        emit_json_result "true" "Promotion stopped at staging by user (production unchanged)." \
+          "$(jq -cn --arg u "$STAGING_URL" '{stage:"staging_only", staging_url:$u, approved:false}')"
+        exit 0
+    fi
+elif [[ "${PROMOTE_APPROVE:-}" =~ ^[yY]([eE][sS])?$ ]]; then
+    log_info "非互動式環境：偵測到 PROMOTE_APPROVE=yes，視為已審批（信任 CI 平台閘門）。"
+else
+    log_error "非互動式環境且未設 PROMOTE_APPROVE=yes → 為避免靜默略過，安全中止晉級。"
+    emit_json_result "false" "Promotion aborted: non-interactive shell without explicit approval." \
+      "$(jq -cn --arg u "$STAGING_URL" '{stage:"staging_only", staging_url:$u, approved:false, required_action:"set_PROMOTE_APPROVE_or_run_interactively"}')"
+    exit 1
 fi
 log_info "已獲批准，開始晉級到 PRODUCTION..."
 
 # ---------- 3. Phase 2：部署 PRODUCTION（失敗自動回滾）----------
 log_info "[3] 部署 PRODUCTION（$PRODUCTION_SCRIPT）..."
-PROD_OUT=$(CLOUDFLARE_ENV=production bash "$SCRIPT_DIR/deploy.sh")
+PROD_OUT=$(SMOKE_WARMUP=10 CLOUDFLARE_ENV=production bash "$SCRIPT_DIR/deploy.sh")
 PROD_OK=$(jget "$PROD_OUT" '.success')
 PROD_ACTION=$(jget "$PROD_OUT" '.data.required_action')
 

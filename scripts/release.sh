@@ -40,7 +40,8 @@ fi
 
 # ---------- 2. 部署（含健康閘門）----------
 log_info "[2/3] 執行 deploy.sh（內含冒煙測試健康閘門）..."
-DEPLOY_OUT=$(bash "$SCRIPT_DIR/deploy.sh")
+# 賦予 Master 發佈流程更長的預設熱身時間（10 秒），確保邊緣節點絕對同步
+DEPLOY_OUT=$(SMOKE_WARMUP="${SMOKE_WARMUP:-10}" bash "$SCRIPT_DIR/deploy.sh")
 DEPLOY_RC=$?
 DEPLOY_OK=$(jget "$DEPLOY_OUT" '.success')
 REQUIRED_ACTION=$(jget "$DEPLOY_OUT" '.data.required_action')
