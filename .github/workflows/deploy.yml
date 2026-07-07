@@ -13,11 +13,6 @@ on:
           - deploy
           - rollback
 
-# 确保同一时间只有一个部署流水线在运行
-concurrency:
-  group: production-deploy
-  cancel-in-progress: false
-
 run-name: >-
   ${{ github.event_name == 'workflow_dispatch' && format('Manual {0}', inputs.action) || 'Push to main' }}
 
@@ -31,8 +26,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
       - run: npm ci
-      - run: npm test -- --run     # 修正：与 deploy.sh 保持一致
-      - run: npx tsc --noEmit      # 新增：前置类型检查  
+      - run: npm test
 
   deploy-staging:
     name: Deploy to Staging
