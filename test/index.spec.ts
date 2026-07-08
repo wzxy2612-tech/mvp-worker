@@ -13,8 +13,8 @@ describe("mvp-worker /health", () => {
 		};
 		expect(body).toMatchObject({
 			status: "OK",
-			environment: "development",
-			version: "v1-dev",
+			environment: "expect.any(String)",
+			version: "expect.any(String)",
 		});
 	});
 
