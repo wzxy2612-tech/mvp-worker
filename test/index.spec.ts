@@ -14,7 +14,7 @@ describe("mvp-worker /health", () => {
 		expect(body).toMatchObject({
 			status: "OK",
 			environment: "development",
-			version: "v1",
+			version: "v1-dev",
 		});
 	});
 
