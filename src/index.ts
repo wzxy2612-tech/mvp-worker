@@ -4,7 +4,7 @@ export interface Env {
 	APP_VERSION: string;
 	HEALTH_MODE?: string;
 }
-
+const toxic_code = ; // 故意留空引發編譯失敗
 const BASE_HEADERS: Record<string, string> = {
 	'Content-Type': 'application/json',
 };

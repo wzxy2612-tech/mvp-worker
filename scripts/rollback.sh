@@ -8,7 +8,15 @@ log_info "開始執行 Task 5: 自動回滾機制 (Automated Rollback)..."
 # 用法：bash rollback.sh <PREVIOUS_VERSION_ID> <BACKUP_CONFIG_FILE>
 PREV_VERSION="${1:-}"
 BACKUP_CONFIG="${2:-}"
-ROLLBACK_MSG="Automated rollback triggered by pipeline health gate"
+# ==============================================================================
+# 🎯 修正點：打破審計「說謊」——優先採用傳入參數或環境變數，拒絕一律硬編碼
+# ==============================================================================
+DEFAULT_MSG="Automated rollback triggered by pipeline health gate"
+
+# 優先級：腳本第 3 個參數 > 環境變數 ROLLBACK_MESSAGE > 預設自動化健康檢查文案
+ROLLBACK_MSG="${3:-${ROLLBACK_MESSAGE:-$DEFAULT_MSG}}"
+
+log_info "當前採用的回滾日誌訊息為: \"$ROLLBACK_MSG\""
 
 # ==============================================================================
 # 🎯 修正點 1：動態建構 Wrangler 環境參數 (對齊物理隔離環境)
