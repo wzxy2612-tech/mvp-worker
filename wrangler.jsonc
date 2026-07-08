@@ -1,29 +1,45 @@
 {
-  // Cloudflare Worker 設定（JSONC，可含註解）
-  "name": "mvp-worker",
+  // ==========================================================
+  // 基礎配置（保留你原有的相容性與運維觀測設定）
+  // ==========================================================
+  "name": "mvp-worker-dev", // 本地或開發環境名稱
   "main": "src/index.ts",
-  "compatibility_date": "2025-06-01",
-
-  // 啟用 workers.dev 網域，讓 deploy.sh 能自動解析出健康檢查 URL
+  "compatibility_date": "2025-06-01", // 保留你原有的 2025 相容性日期
   "workers_dev": true,
-
-  // 開啟 Workers 觀測（供 wrangler tail / GraphQL analytics）
   "observability": {
     "enabled": true
   },
 
-  // 環境變數（名稱需與 index.ts 的 Env 介面一致）：
-  //   ENVIRONMENT  執行環境；設為 "production" 時會關閉下方 HEALTH_MODE 失敗注入
-  //   APP_VERSION  版本標記，回滾後可肉眼確認
-  //   HEALTH_MODE  demo/測試用；改成 "broken" 且 ENVIRONMENT != production 時，
-  //                /health 會回 500，用來演練健康閘門 + 自動回滾
+  // ==========================================================
+  // 1. 本地/開發環境（Development）專屬變數
+  //    在這裡我們徹底刪除了 GITHUB_OWNER、GITHUB_REPO 等 GitHub 變數
+  // ==========================================================
   "vars": {
     "ENVIRONMENT": "development",
-    "APP_VERSION": "v1",
-    "HEALTH_MODE": "ok",
-    // 務必把這三行補進來
-    "GITHUB_OWNER": "wzxy2612-tech",
-    "GITHUB_REPO": "mvp-worker",
-    "GITHUB_WORKFLOW_FILE": "deploy.yml"
+    "APP_VERSION": "v1-dev",
+    "HEALTH_MODE": "ok"
+  },
+
+  // ==========================================================
+  // 2. 多環境分發區塊（Staging 與 Production）
+  //    走 GitHub Actions 晉級流水線時，會自動讀取對應的環境區塊
+  // ==========================================================
+  "env": {
+    "staging": {
+      "name": "mvp-worker-staging",
+      "vars": {
+        "ENVIRONMENT": "staging",
+        "APP_VERSION": "v1-staging",
+        "HEALTH_MODE": "ok"
+      }
+    },
+    "production": {
+      "name": "mvp-worker-production",
+      "vars": {
+        "ENVIRONMENT": "production",
+        "APP_VERSION": "v1-prod", // 生產環境正式版本標籤
+        "HEALTH_MODE": "ok"       // 生產環境下，index.ts 會無視 broken 注入，確保安全
+      }
+    }
   }
 }

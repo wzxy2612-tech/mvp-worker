@@ -1,18 +1,14 @@
 name: Promote Pipeline
 
-# 動態全域並發鎖：完美的“救護車”機制
-concurrency:
-  group: production-deploy
-  # 如果手動手動選擇 rollback，值變為 true，立刻強殺線上衝突任務；常規 push/deploy 則為 false，老實排隊
-  cancel-in-progress: ${{ github.event.inputs.action == 'rollback' }}
+# 【重要修正】移除了顶层的 concurrency 锁，避免 push 触发时踩空值
 
 on:
   push:
-    branches: ["main"] # 每次合并到 main 分支触发
+    branches: ["main"]
   workflow_dispatch:
     inputs:
       action:
-        description: "deploy：走完整流程（test → staging → production）；rollback：跳过 test/staging，直接回滚生产"
+        description: "操作路由 (deploy: 走完整发版流 | rollback: 极速回滚)"
         type: choice
         required: true
         default: deploy
@@ -25,8 +21,9 @@ on:
         required: false
         default: ""
 
+# 统一使用 github.event.inputs 保持变量语义一致性
 run-name: >-
-  ${{ github.event_name == 'workflow_dispatch' && format('Manual {0}', inputs.action) || 'Push to main' }}
+  ${{ github.event_name == 'workflow_dispatch' && format('Manual {0}', github.event.inputs.action) || 'Push to main' }}
 
 jobs:
   test:
@@ -62,8 +59,12 @@ jobs:
     name: Deploy to Production
     needs: deploy-staging
     runs-on: ubuntu-latest
-    environment: production # 触发你在 GitHub 配置的人工审批
+    environment: production
     if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
+    # 【新增】Job 级别的并发排队锁（正规军：不互相强杀，老实排队）
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -75,7 +76,6 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          # 尝试部署，如果 deploy.sh 返回非 0 失败，则执行 rollback 并在完成后抛出异常
           bash scripts/deploy.sh || {
             echo "::error::部署或健康检查失败，正在触发回滚..."
             bash scripts/rollback.sh
@@ -85,10 +85,13 @@ jobs:
   rollback:
     name: Rollback Production (manual)
     runs-on: ubuntu-latest
-    # 独立入口，不 needs 任何 job：出事故时回滚不该排在 test/staging 后面，
-    # 必须是整条流水线里最快、最少依赖的一条路径。
-    if: ${{ github.event.inputs.action == 'rollback' && github.event.inputs.confirm_rollback == 'YES_ROLLBACK' }}
-    environment: production-rollback # 与 production 共享 secrets，但不设 required reviewers，保证回滚够快
+    # 追加了 event_name 判断，彻底杜绝 push 事件意外解析该逻辑的可能性
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'rollback' && github.event.inputs.confirm_rollback == 'YES_ROLLBACK' }}
+    environment: production-rollback
+    # 【新增】Job 级别的抢占锁（救护车：强制踢掉同组正在运行的部署任务）
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
