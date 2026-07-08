@@ -4,7 +4,7 @@
   // ==========================================================
   "name": "mvp-worker-dev", // 本地或開發環境名稱
   "main": "src/index.ts",
-  "compatibility_date": "2099-12-31", // 保留你原有的 2025 相容性日期
+  "compatibility_date": "2025-06-01", // 保留你原有的 2025 相容性日期
   "workers_dev": true,
   "observability": {
     "enabled": true
