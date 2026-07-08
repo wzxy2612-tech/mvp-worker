@@ -10,28 +10,62 @@ PREV_VERSION="${1:-}"
 BACKUP_CONFIG="${2:-}"
 ROLLBACK_MSG="Automated rollback triggered by pipeline health gate"
 
+# ==============================================================================
+# 🎯 修正點 1：動態建構 Wrangler 環境參數 (對齊物理隔離環境)
+# ==============================================================================
+WRANGLER_ARGS=()
+if [ -n "$CLOUDFLARE_ENV" ]; then
+    log_info "偵測到目標環境變數 CLOUDFLARE_ENV: $CLOUDFLARE_ENV"
+    WRANGLER_ARGS+=("--env" "$CLOUDFLARE_ENV")
+else
+    log_warn "未指定 CLOUDFLARE_ENV，將嘗試對頂層預設環境進行操作..."
+fi
+
 log_info "啟動 Cloudflare 邊緣程式碼回滾程序..."
 
 # 1. Cloudflare 原生回滾
-#    wrangler rollback 預設互動式（會問 y/n）。使用 --yes 跳過確認。
+# wrangler rollback 預設互動式（會問 y/n）。使用 --yes 跳過確認。
 if [ -n "$PREV_VERSION" ]; then
     log_info "偵測到指定歷史版本 ID: $PREV_VERSION，嘗試精確回滾..."
-    ROLLBACK_OUTPUT=$(npx wrangler rollback "$PREV_VERSION" --message "$ROLLBACK_MSG" --yes 2>&1)
+    ROLLBACK_OUTPUT=$(npx wrangler rollback "$PREV_VERSION" --message "$ROLLBACK_MSG" --yes "${WRANGLER_ARGS[@]}" 2>&1)
 else
     log_info "未指定版本 ID，退回上一個穩定版本..."
-    ROLLBACK_OUTPUT=$(npx wrangler rollback --message "$ROLLBACK_MSG" --yes 2>&1)
+    ROLLBACK_OUTPUT=$(npx wrangler rollback --message "$ROLLBACK_MSG" --yes "${WRANGLER_ARGS[@]}" 2>&1)
 fi
 ROLLBACK_STATUS=$?
 
-# 關鍵防禦點：捕獲回滾本身的報錯，避免死循環
+# ==============================================================================
+# 🎯 修正點 2：關鍵防禦點升级——捕獲並識別「無歷史版本」的全新環境窄邊界
+# ==============================================================================
 if [ $ROLLBACK_STATUS -ne 0 ]; then
+    # 檢查 Wrangler 錯誤訊息中是否包含無歷史發布、找不到版本或只有單一版本的特徵
+    if echo "$ROLLBACK_OUTPUT" | grep -iqE "no.*deployment|not found|only one deployment|cannot rollback"; then
+        log_warn "⚠️ 【窄邊界命中】Cloudflare 回滾跳過：環境 '${CLOUDFLARE_ENV:-default}' 可能為全新建立，尚無足夠的歷史版本紀錄可供回退。"
+        echo "$ROLLBACK_OUTPUT"
+        
+        DATA_NO_HISTORY=$(cat <<EOF
+{
+  "status": "skipped_no_history",
+  "message": "Rollback skipped because the target environment has no previous deployment history to revert to.",
+  "wrangler_output": "No previous deployments found",
+  "environment_targeted": "${CLOUDFLARE_ENV:-default}"
+}
+EOF
+)
+        emit_json_result "true" "Rollback handled: No history available for environment '${CLOUDFLARE_ENV:-default}'." "$DATA_NO_HISTORY"
+        # 這是可預期的初始邊界，不讓流水線報紅崩潰，優雅退出
+        exit 0
+    fi
+
+    # 若非上述良性邊界，則判定為真正的硬性失敗（如網路崩潰、Token 失效等）
     log_error "【緊急警告】Cloudflare 回滾操作硬性失敗！"
     echo "$ROLLBACK_OUTPUT" >&2
     DATA_CRITICAL=$(cat <<EOF
 {
   "status": "critical_failure",
   "message": "Rollback failed, manual intervention required",
-  "wrangler_error": "CLI execution error"
+  "wrangler_error": "CLI execution error",
+  "environment_targeted": "${CLOUDFLARE_ENV:-default}"
 }
 EOF
 )
@@ -65,7 +99,6 @@ else
 fi
 
 # 說明：還原的是「本地」設定檔，供下次部署使用；
-# 它不會自動改變線上狀態（否則會產生新版本而抵銷本次回滾）。
 if [ "$CONFIG_RESTORED" = "true" ]; then
     log_info "提醒：本地設定檔已還原；若需讓路由／變數等配置生效，請於確認後另行部署。"
 fi
@@ -77,6 +110,7 @@ DATA_SUCCESS=$(cat <<EOF
   "status": "rollback_completed",
   "required_action": "manual_review_code",
   "previous_version_targeted": "${PREV_VERSION:-latest_stable}",
+  "environment_targeted": "${CLOUDFLARE_ENV:-default}",
   "config_restored": $CONFIG_RESTORED,
   "timestamp": $(date +%s)
 }
