@@ -1,4 +1,4 @@
-export interface Env {/health
+export interface Env {
 	// 只有基础設定與健康閘門變數，沒有任何 Secret
 	ENVIRONMENT: string;
 	APP_VERSION: string;
@@ -20,13 +20,15 @@ export default {
 			// ==========================================================
 			// 1. /health 端點 (純淨的探活邏輯)
 			// ==========================================================
-		if (url.pathname === '/health') {
-        // 🚨 E2E 生产回滚演练：无视任何环境，直接返回 500
-        return new Response(
-            JSON.stringify({ status: 'ERROR', reason: 'E2E Rollback Drill', version: env.APP_VERSION }),
-            { status: 500, headers: BASE_HEADERS }
-        );
-        }
+			if (url.pathname === '/health') {
+				if (env.HEALTH_MODE === 'broken' && env.ENVIRONMENT !== 'production') {
+					statusCode = 500;
+					statusText = "Simulated Failure";
+					return new Response(
+						JSON.stringify({ status: 'ERROR', reason: 'simulated failure', version: env.APP_VERSION }),
+						{ status: 500, headers: BASE_HEADERS },
+					);
+				}
 
 				statusCode = 200;
 				statusText = "OK";
