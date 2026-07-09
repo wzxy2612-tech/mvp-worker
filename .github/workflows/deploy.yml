@@ -75,7 +75,6 @@ jobs:
           CLOUDFLARE_ENV: production
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          HEALTH_PATH: /__rollback_drill__
         run: |
           bash scripts/deploy.sh || {
             echo "::error::部署或健康检查失败，正在触发回滚..."
