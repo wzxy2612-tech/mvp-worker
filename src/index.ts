@@ -1,8 +1,8 @@
 export interface Env {
-	// 只有基础設定與健康閘門變數，沒有任何 Secret
 	ENVIRONMENT: string;
 	APP_VERSION: string;
 	HEALTH_MODE?: string;
+	CONFIG_KV: KVNamespace;
 }
 
 const BASE_HEADERS: Record<string, string> = {
@@ -18,7 +18,8 @@ export default {
 
 		try {
 			// ==========================================================
-			// 1. /health 端點 (純淨的探活邏輯)
+			// 🛡️ 1. 探活路由絕對豁免 (Health Check Bypass)
+			// 流水線依賴它來判斷 Worker 存活，絕對不能被業務維護模式誤傷
 			// ==========================================================
 			if (url.pathname === '/health') {
 				if (env.HEALTH_MODE === 'broken' && env.ENVIRONMENT !== 'production') {
@@ -29,7 +30,6 @@ export default {
 						{ status: 500, headers: BASE_HEADERS },
 					);
 				}
-
 				statusCode = 200;
 				statusText = "OK";
 				return json({
@@ -40,8 +40,38 @@ export default {
 				}, statusCode, statusText);
 			}
 
+			// ==========================================
+			// 🚨 2. 邊緣動態維護模式攔截 (Gatekeeper)
+			// 這裡只攔截探活以外的真實業務流量
+			// ==========================================
+			let isMaintenance = false;
+			try {
+				const rawValue = await env.CONFIG_KV.get("MAINTENANCE_MODE", { cacheTtl: 30 });
+				isMaintenance = rawValue === 'true';
+			} catch (e) {
+				console.error("─── ⚠️ Config KV Read Failed, Failing Open ───\n", e);
+			}
+
+			if (isMaintenance) {
+				statusCode = 503; 
+				statusText = "Service Unavailable";
+				return new Response(
+					JSON.stringify({ 
+						success: false, 
+						message: "The system is currently undergoing scheduled maintenance. Please try again later." 
+					}), 
+					{ 
+						status: 503, 
+						headers: { 
+							"Content-Type": "application/json",
+							"Retry-After": "60" 
+						} 
+					}
+				);
+			}
+
 			// ==========================================================
-			// 其他未定義路徑 (404) - 未來這裡放你的真實業務邏輯
+			// 🚦 3. 其他未定義路徑 (404) - 你的真實業務邏輯
 			// ==========================================================
 			statusCode = 404;
 			statusText = "Not Found";

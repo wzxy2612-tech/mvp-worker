@@ -11,8 +11,14 @@
   },
 
   // ==========================================================
+  // 🔗 頂層資源綁定（本地開發 npx wrangler dev 預設使用）
+  // ==========================================================
+  "kv_namespaces": [
+    { "binding": "CONFIG_KV", "id": "7cb1358101494bc2baf36a1275301202" }
+  ],
+
+  // ==========================================================
   // 1. 本地/開發環境（Development）專屬變數
-  //    在這裡我們徹底刪除了 GITHUB_OWNER、GITHUB_REPO 等 GitHub 變數
   // ==========================================================
   "vars": {
     "ENVIRONMENT": "development",
@@ -27,6 +33,10 @@
   "env": {
     "staging": {
       "name": "mvp-worker-staging",
+      // ⚠️ 必須顯式聲明，否則 Staging 環境無法讀取控制面 KV
+      "kv_namespaces": [
+        { "binding": "CONFIG_KV", "id": "7cb1358101494bc2baf36a1275301202" }
+      ],
       "vars": {
         "ENVIRONMENT": "staging",
         "APP_VERSION": "v1-staging",
@@ -35,6 +45,10 @@
     },
     "production": {
       "name": "mvp-worker-production",
+      // ⚠️ 必須顯式聲明，否則線上生產環境直接崩潰或讀不到熔斷訊號
+      "kv_namespaces": [
+        { "binding": "CONFIG_KV", "id": "7cb1358101494bc2baf36a1275301202" }
+      ],
       "vars": {
         "ENVIRONMENT": "production",
         "APP_VERSION": "v1-prod", // 生產環境正式版本標籤
