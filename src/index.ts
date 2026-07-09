@@ -21,14 +21,14 @@ export default {
 			// 1. /health 端點 (純淨的探活邏輯)
 			// ==========================================================
 			if (url.pathname === '/health') {
-				if (env.HEALTH_MODE === 'broken' && env.ENVIRONMENT !== 'production') {
-					statusCode = 500;
-					statusText = "Simulated Failure";
-					return new Response(
-						JSON.stringify({ status: 'ERROR', reason: 'simulated failure', version: env.APP_VERSION }),
-						{ status: 500, headers: BASE_HEADERS },
-					);
-				}
+    // 🎯 只有當環境明確是 production 時才下毒，本地測試（test/local）一律放行！
+    if (env.ENVIRONMENT === 'production') {
+        return new Response(
+            JSON.stringify({ status: 'ERROR', reason: 'E2E Production Rollback Drill', version: env.APP_VERSION }),
+            { status: 500, headers: BASE_HEADERS }
+        );
+     }
+   }
 
 				statusCode = 200;
 				statusText = "OK";
