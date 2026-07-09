@@ -1,4 +1,4 @@
-name: Promote Pipeline
+name: MVP Worker CI/CD
 
 # 【重要修正】移除了顶层的 concurrency 锁，避免 push 触发时踩空值
 
@@ -20,10 +20,14 @@ on:
         type: string
         required: false
         default: ""
+      trace_id:
+        description: "Correlation ID from control plane"
+        required: false
+        type: string
+        default: ""
 
-# 统一使用 github.event.inputs 保持变量语义一致性
 run-name: >-
-  ${{ github.event_name == 'workflow_dispatch' && format('Manual {0}', github.event.inputs.action) || 'Push to main' }}
+  ${{ github.event_name == 'workflow_dispatch' && format('部署分支/环境: {0} | 溯源ID: {1}', github.ref_name, inputs.trace_id || 'manual') || format('Push: {0}', github.sha) }}
 
 jobs:
   test:
