@@ -5,6 +5,37 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/utils.sh"
 
+# ── [新增] 终态回报到控制面 /audit(best-effort,绝不影响部署退出码)──────────
+emit_event() {  # <action> <ok 0|1> [detail]
+  local action="$1" ok="$2" detail="${3:-}"
+  if [ -z "${CONTROLLER_URL:-}" ] || [ -z "${TRIGGER_SECRET:-}" ] || [ -z "${TRACE_ID:-}" ]; then
+    log_warn "emit_event 跳过 [$action]:缺 CONTROLLER_URL/TRIGGER_SECRET/TRACE_ID"; return 0
+  fi
+  detail="${detail//\"/}"; detail="${detail//$'\n'/ }"
+  curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
+    -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
+    -d "$(printf '{"trace_id":"%s","action":"%s","dispatch_ok":%s,"detail":"%s"}' "$TRACE_ID" "$action" "$ok" "$detail")" \
+    >/dev/null 2>&1 || log_warn "emit_event 回报失败 [$action](best-effort,已忽略)"
+  return 0
+}
+# 无论从哪个 exit 退出都回报一次;按 CLOUDFLARE_ENV 分:staging→gate_passed、prod→deploy_ok、失败→deploy_fail
+_REPORTED=0
+report_outcome() {
+  local rc=$1
+  [ "$_REPORTED" -eq 1 ] && return 0
+  _REPORTED=1
+  if [ "$rc" -eq 0 ]; then
+    if [ "${CLOUDFLARE_ENV:-}" = "production" ]; then
+      emit_event deploy_ok 1 "prod deploy + health ok"
+    else
+      emit_event gate_passed 1 "${CLOUDFLARE_ENV:-staging} deploy + health ok"
+    fi
+  else
+    emit_event deploy_fail 0 "${CLOUDFLARE_ENV:-?} deploy failed rc=$rc"
+  fi
+}
+trap 'report_outcome $?' EXIT
+
 log_info "開始執行 Task 4: 自動化發佈與健康閘門..."
 
 # 0. 前置閘門：測試與型別檢查

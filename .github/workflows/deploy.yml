@@ -46,6 +46,10 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     environment: staging
+    env:
+      CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
+      TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
+      TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
     if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
     steps:
       - uses: actions/checkout@v4
@@ -64,6 +68,10 @@ jobs:
     needs: deploy-staging
     runs-on: ubuntu-latest
     environment: production
+    env:
+      CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
+      TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
+      TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
     if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
     # 【新增】Job 级别的并发排队锁（正规军：不互相强杀，老实排队）
     concurrency:
@@ -74,6 +82,11 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
       - run: npm ci
+      - name: Signal prod_started
+        run: |
+          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
+            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
+            -d "{\"trace_id\":\"$TRACE_ID\",\"action\":\"prod_started\",\"dispatch_ok\":1,\"detail\":\"approved, deploying prod\"}" || true
       - name: Deploy Production & Rollback on Fail
         env:
           CLOUDFLARE_ENV: production
@@ -88,6 +101,12 @@ jobs:
             ROLLBACK_MESSAGE="Auto rollback: production health gate failed" ROLLBACK_SOURCE="auto_rollback" bash scripts/rollback.sh
             exit 1
           }
+      - name: Signal cancelled
+        if: cancelled()
+        run: |
+          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
+            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
+            -d "{\"trace_id\":\"$TRACE_ID\",\"action\":\"cancelled\",\"dispatch_ok\":0,\"detail\":\"preempted by rollback\"}" || true
 
   rollback:
     name: Rollback Production (manual)
