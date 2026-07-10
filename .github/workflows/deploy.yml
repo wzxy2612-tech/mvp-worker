@@ -81,7 +81,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
           TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
-          TRACE_ID: ${{ github.event.inputs.trace_id || '' }}
+          TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
         run: |
           bash scripts/deploy.sh || {
             echo "::error::部署或健康检查失败，正在触发回滚..."
@@ -111,7 +111,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
           TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
-          TRACE_ID: ${{ github.event.inputs.trace_id || '' }}
+          TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
           ROLLBACK_SOURCE: "manual_rollback"
           ROLLBACK_MESSAGE: "Manual rollback via control plane"
         run: bash scripts/rollback.sh
