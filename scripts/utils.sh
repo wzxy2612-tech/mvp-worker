@@ -15,6 +15,10 @@ log_error() {
     echo -e "\033[31m[ERROR]\033[0m $1" >&2
 }
 
+log_warn() {
+    echo -e "\033[33m[WARN]\033[0m $1" >&2
+}
+
 # ---------- JSON 字串轉義 ----------
 # 只處理最常見的破壞字元：反斜線、雙引號、Tab；換行/Enter 轉成空白，
 # 避免動態訊息破壞單行 JSON envelope。
