@@ -79,10 +79,13 @@ jobs:
           CLOUDFLARE_ENV: production
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
+          TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
+          TRACE_ID: ${{ github.event.inputs.trace_id || '' }}
         run: |
           bash scripts/deploy.sh || {
             echo "::error::部署或健康检查失败，正在触发回滚..."
-            ROLLBACK_MESSAGE="Auto rollback: production health gate failed" bash scripts/rollback.sh
+            ROLLBACK_MESSAGE="Auto rollback: production health gate failed" ROLLBACK_SOURCE="auto_rollback" bash scripts/rollback.sh
             exit 1
           }
 
@@ -106,5 +109,9 @@ jobs:
           CLOUDFLARE_ENV: production
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
+          TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
+          TRACE_ID: ${{ github.event.inputs.trace_id || '' }}
+          ROLLBACK_SOURCE: "manual_rollback"
           ROLLBACK_MESSAGE: "Manual rollback via control plane"
         run: bash scripts/rollback.sh

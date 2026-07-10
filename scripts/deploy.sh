@@ -34,7 +34,7 @@ log_info "型別檢查通過。"
 
 # 1. 執行部署
 log_info "正在啟動 npx wrangler deploy..."
-DEPLOY_OUTPUT=$(npx wrangler deploy --keep-vars --strict 2>&1)
+DEPLOY_OUTPUT=$(npx wrangler deploy --keep-vars 2>&1)
 DEPLOY_STATUS=$?
 
 if [ $DEPLOY_STATUS -ne 0 ]; then

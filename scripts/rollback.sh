@@ -5,6 +5,65 @@ source "$SCRIPT_DIR/utils.sh"
 
 log_info "開始執行 Task 5: 自動回滾機制 (Automated Rollback)..."
 
+# ==============================================================================
+# 🎯 補盲區小鏟子：向控制面同步回滾審計日誌
+# ==============================================================================
+send_audit_log() {
+    local status_type="$1"
+    local msg="$2"
+    local disp_ok=0
+    local http_st=500
+
+    if [ "$status_type" = "completed" ]; then
+        disp_ok=1
+        http_st=200
+    elif [ "$status_type" = "skipped_no_history" ]; then
+        disp_ok=1
+        http_st=204
+    fi
+
+    # 關鍵防禦：若環境變數未配，優雅跳過不卡死流水線
+    if [ -z "${CONTROLLER_URL:-}" ] || [ -z "${TRIGGER_SECRET:-}" ]; then
+        log_warn "未配置 CONTROLLER_URL 或 TRIGGER_SECRET，跳過向控制面發送審計通知。"
+        return 0
+    fi
+
+    log_info "正在向控制面同步回滾審計日誌 (${status_type})..."
+
+    # 利用 json_escape 安全處理 msg，避免 JSON 注入
+    local safe_msg
+    safe_msg=$(json_escape "$msg")
+
+    local payload
+    payload=$(cat <<EOF
+{
+  "action": "${ROLLBACK_SOURCE:-auto_rollback}",
+  "ref": "${CLOUDFLARE_ENV:-default}",
+  "trace_id": "${TRACE_ID:-}",
+  "dispatch_ok": $disp_ok,
+  "http_status": $http_st,
+  "detail": "$safe_msg"
+}
+EOF
+)
+
+    local curl_out
+    curl_out=$(curl -s -w "\n%{http_code}" -X POST "${CONTROLLER_URL}/audit" \
+      -H "Content-Type: application/json" \
+      -H "X-Trigger-Secret: ${TRIGGER_SECRET}" \
+      --connect-timeout 5 --max-time 10 \
+      -d "$payload" 2>&1)
+
+    local curl_status=$?
+    if [ $curl_status -eq 0 ]; then
+        local http_code
+        http_code=$(echo "$curl_out" | tail -n1)
+        log_info "控制面審計 API 響應狀態碼: $http_code"
+    else
+        log_warn "向控制面發送審計日誌失敗，curl 退出碼: $curl_status"
+    fi
+}
+
 # 用法：bash rollback.sh <PREVIOUS_VERSION_ID> <BACKUP_CONFIG_FILE>
 PREV_VERSION="${1:-}"
 BACKUP_CONFIG="${2:-}"
@@ -61,6 +120,9 @@ if [ $ROLLBACK_STATUS -ne 0 ]; then
 EOF
 )
         emit_json_result "true" "Rollback handled: No history available for environment '${CLOUDFLARE_ENV:-default}'." "$DATA_NO_HISTORY"
+
+        send_audit_log "skipped_no_history" "Rollback skipped: Target environment has no previous deployment history."
+
         # 這是可預期的初始邊界，不讓流水線報紅崩潰，優雅退出
         exit 0
     fi
@@ -78,6 +140,9 @@ EOF
 EOF
 )
     emit_json_result "false" "CRITICAL: Automated rollback collapsed. Edge state is unknown." "$DATA_CRITICAL"
+
+    send_audit_log "critical_failure" "CRITICAL: Automated rollback failed during wrangler execution."
+
     exit 2
 fi
 
@@ -113,6 +178,9 @@ fi
 
 # 3. 成功輸出
 log_info "自動回滾程序完成，程式碼已恢復至上一穩定版本。"
+
+send_audit_log "completed" "Rollback successfully executed and code reverted to the previous stable version."
+
 DATA_SUCCESS=$(cat <<EOF
 {
   "status": "rollback_completed",
