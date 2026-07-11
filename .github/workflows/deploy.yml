@@ -46,6 +46,10 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     environment: staging
+    # 【Patch 2】Staging 也要串行，防止裸奔和批量制造 ghost gate_waiting
+    concurrency:
+      group: staging-deploy
+      cancel-in-progress: false
     env:
       CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
       TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
@@ -73,7 +77,7 @@ jobs:
       TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
       TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
     if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
-    # 【新增】Job 级别的并发排队锁（正规军：不互相强杀，老实排队）
+    # Job 级别的并发排队锁（正规军：不互相强杀，老实排队）
     concurrency:
       group: production-deploy
       cancel-in-progress: false
@@ -87,7 +91,17 @@ jobs:
           curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
             -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
             -d "{\"trace_id\":\"$TRACE_ID\",\"action\":\"prod_started\",\"dispatch_ok\":1,\"detail\":\"approved, deploying prod\"}" || true
-      - name: Deploy Production & Rollback on Fail
+      
+      # 【Patch 1】将 deploy 和 auto_rollback 从 bash || 中拆开，避免抢占时引发竞争回滚
+      - name: Deploy Production
+        env:
+          CLOUDFLARE_ENV: production
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash scripts/deploy.sh
+        
+      - name: Auto rollback on failure
+        if: failure() # 只有真失败才执行，被 cancel 抢占时求值为 false
         env:
           CLOUDFLARE_ENV: production
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -95,18 +109,19 @@ jobs:
           CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
           TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
           TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
+          ROLLBACK_MESSAGE: "Auto rollback: production health gate failed"
+          ROLLBACK_SOURCE: "auto_rollback"
         run: |
-          bash scripts/deploy.sh || {
-            echo "::error::部署或健康检查失败，正在触发回滚..."
-            ROLLBACK_MESSAGE="Auto rollback: production health gate failed" ROLLBACK_SOURCE="auto_rollback" bash scripts/rollback.sh
-            exit 1
-          }
+          echo "::error::部署或健康检查失败，正在触发回滚..."
+          bash scripts/rollback.sh
+
       - name: Signal cancelled
         if: cancelled()
         run: |
           curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
             -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
-            -d "{\"trace_id\":\"$TRACE_ID\",\"action\":\"cancelled\",\"dispatch_ok\":0,\"detail\":\"preempted by rollback\"}" || true
+            # 取消硬编码的抢占理由，改为更诚实的描述
+            -d "{\"trace_id\":\"$TRACE_ID\",\"action\":\"cancelled\",\"dispatch_ok\":0,\"detail\":\"job cancelled while running (preemption or manual)\"}" || true
 
   rollback:
     name: Rollback Production (manual)
@@ -114,7 +129,7 @@ jobs:
     # 追加了 event_name 判断，彻底杜绝 push 事件意外解析该逻辑的可能性
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'rollback' && github.event.inputs.confirm_rollback == 'YES_ROLLBACK' }}
     environment: production-rollback
-    # 【新增】Job 级别的抢占锁（救护车：强制踢掉同组正在运行的部署任务）
+    # Job 级别的抢占锁（救护车：强制踢掉同组正在运行的部署任务）
     concurrency:
       group: production-deploy
       cancel-in-progress: true
@@ -130,7 +145,20 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
           TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
-          TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
+          # 【Patch 3 附带】修改回滚兜底 trace_id 为 rollback-{0}
+          TRACE_ID: ${{ github.event.inputs.trace_id || format('rollback-{0}', github.run_id) }}
           ROLLBACK_SOURCE: "manual_rollback"
           ROLLBACK_MESSAGE: "Manual rollback via control plane"
         run: bash scripts/rollback.sh
+        
+      # 【Patch 3】防止第二个回滚抢占第一个回滚时产生静默 ghost
+      - name: Signal cancelled
+        if: cancelled()
+        env:
+          CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
+          TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
+          TRACE_ID: ${{ github.event.inputs.trace_id || format('rollback-{0}', github.run_id) }}
+        run: |
+          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
+            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
+            -d "{\"trace_id\":\"$TRACE_ID\",\"action\":\"cancelled\",\"dispatch_ok\":0,\"detail\":\"rollback job cancelled (preempted by a newer rollback)\"}" || true
