@@ -1,10 +1,3 @@
-export interface Env {
-	ENVIRONMENT: string;
-	APP_VERSION: string;
-	HEALTH_MODE?: string;
-	CONFIG_KV: KVNamespace;
-}
-
 const BASE_HEADERS: Record<string, string> = {
 	'Content-Type': 'application/json',
 };
@@ -22,7 +15,7 @@ export default {
 			// 流水線依賴它來判斷 Worker 存活，絕對不能被業務維護模式誤傷
 			// ==========================================================
 			if (url.pathname === '/health') {
-				if (env.HEALTH_MODE === 'broken' && env.ENVIRONMENT !== 'production') {
+				if ((env.HEALTH_MODE as string) === 'broken' && env.ENVIRONMENT !== 'production') {
 					statusCode = 500;
 					statusText = "Simulated Failure";
 					return new Response(
