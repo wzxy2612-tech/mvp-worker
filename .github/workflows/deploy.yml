@@ -30,16 +30,96 @@ run-name: >-
   ${{ github.event_name == 'workflow_dispatch' && format('部署分支/环境: {0} | 溯源ID: {1}', github.ref_name, inputs.trace_id || 'manual') || format('Push: {0}', github.sha) }}
 
 jobs:
-  test:
-    name: Run Tests
+  preflight:
+    name: Preflight & Lock Check
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
+    env:
+      CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
+      TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
+      TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
+      RUN_ID: ${{ github.run_id }}
+    steps:
+      # ① 無條件發出出生證明 (獲取數據庫 seq)
+      # ② 基於自身 trace_id 查 /lock (First-wins: min_seq 最小的活躍 trace 佔有鎖)
+      # ③ 如果被鎖，發死亡證明並自盡
+      - name: Emit pipeline_started & Lock Check
+        run: |
+          set -euo pipefail
+
+          # ① 無條件發出出生證明 (獲取數據庫 seq)
+          BODY=$(jq -nc --arg t "$TRACE_ID" --arg r "$RUN_ID" \
+            '{trace_id:$t, action:"pipeline_started", dispatch_ok:1, detail:({run_id:$r}|tostring)}')
+
+          HTTP_START=$(curl -sS --max-time 10 --retry 2 -o /tmp/audit.out -w '%{http_code}' \
+            -X POST "${CONTROLLER_URL%/}/audit" \
+            -H "X-Trigger-Secret: $TRIGGER_SECRET" \
+            -H "Content-Type: application/json" \
+            -d "$BODY") || HTTP_START="000"
+
+          if [[ ! "$HTTP_START" =~ ^2 ]]; then
+            echo "::error::pipeline_started 未落庫 (HTTP $HTTP_START)。鎖失明，中止。"
+            cat /tmp/audit.out || true
+            exit 1
+          fi
+
+          # ② 基於自身 trace_id 查鎖 (尋找是否有更早的 seq)
+          HTTP_LOCK=$(curl -sS --max-time 10 -o /tmp/lock.out -w '%{http_code}' \
+            -X GET "${CONTROLLER_URL%/}/lock?trace_id=$TRACE_ID" \
+            -H "X-Trigger-Secret: $TRIGGER_SECRET") || HTTP_LOCK="000"
+
+          if [[ "$HTTP_LOCK" == "409" ]]; then
+            echo "::error::被更早的活躍任務鎖定。主動退讓以避免破壞環境。"
+            cat /tmp/lock.out || true
+
+            # ③ 被拒的 trace 發送 pipeline_failed (死亡證明) 以釋放自己的佔用
+            FAIL_BODY=$(jq -nc --arg t "$TRACE_ID" \
+              '{trace_id:$t, action:"pipeline_failed", dispatch_ok:0, detail:"Preempted by older trace at lock check"}')
+            curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
+              -H "X-Trigger-Secret: $TRIGGER_SECRET" \
+              -H "Content-Type: application/json" \
+              -d "$FAIL_BODY" || true
+            exit 1
+          elif [[ ! "$HTTP_LOCK" =~ ^2 ]]; then
+            echo "::error::查鎖失敗 (HTTP $HTTP_LOCK)。Fail-closed 啟動，中止。"
+            exit 1
+          fi
+
+          echo "鎖檢查通過，准許部署。"
+
+  test:
+    name: Run Tests
+    needs: preflight
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
+    env:
+      CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
+      TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
+      TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
       - run: npm ci
       - run: npm test
+
+      - name: Signal pipeline_failed
+        if: failure()
+        run: |
+          BODY=$(jq -nc --arg t "$TRACE_ID" \
+            '{trace_id:$t, action:"pipeline_failed", dispatch_ok:0, detail:"test/npm ci failed before any deploy"}')
+          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
+            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
+            -d "$BODY" || true
+
+      - name: Signal cancelled
+        if: cancelled()
+        run: |
+          BODY=$(jq -nc --arg t "$TRACE_ID" \
+            '{trace_id:$t, action:"cancelled", dispatch_ok:0, detail:"test job cancelled"}')
+          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
+            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
+            -d "$BODY" || true
 
   deploy-staging:
     name: Deploy to Staging
@@ -67,6 +147,24 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: bash scripts/deploy.sh
 
+      - name: Signal pipeline_failed
+        if: failure()
+        run: |
+          BODY=$(jq -nc --arg t "$TRACE_ID" \
+            '{trace_id:$t, action:"pipeline_failed", dispatch_ok:0, detail:"staging deploy failed before reaching production"}')
+          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
+            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
+            -d "$BODY" || true
+
+      - name: Signal cancelled
+        if: cancelled()
+        run: |
+          BODY=$(jq -nc --arg t "$TRACE_ID" \
+            '{trace_id:$t, action:"cancelled", dispatch_ok:0, detail:"staging job cancelled"}')
+          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
+            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
+            -d "$BODY" || true
+
   deploy-production:
     name: Deploy to Production
     needs: deploy-staging
@@ -77,7 +175,9 @@ jobs:
       TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
       TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
     if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
-    # Job 级别的并发排队锁（正规军：不互相强杀，老实排队）
+    # 并发驱逐锁。cancel-in-progress: false 下 GitHub 的默认行为是 queue: single —
+    # 后来者不会强杀先来者,但当先来者自然结束后,队列里的下一个立即顶上。
+    # 注意这并非"老实排队",late-arriving waiter 会抢占最早 waiter 的执行权。
     concurrency:
       group: production-deploy
       cancel-in-progress: false
@@ -118,10 +218,12 @@ jobs:
       - name: Signal cancelled
         if: cancelled()
         run: |
+          # 取消硬编码的抢占理由，改为更诚实的描述
+          BODY=$(jq -nc --arg t "$TRACE_ID" \
+            '{trace_id:$t, action:"cancelled", dispatch_ok:0, detail:"job cancelled while running (preemption or manual)"}')
           curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
             -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
-            # 取消硬编码的抢占理由，改为更诚实的描述
-            -d "{\"trace_id\":\"$TRACE_ID\",\"action\":\"cancelled\",\"dispatch_ok\":0,\"detail\":\"job cancelled while running (preemption or manual)\"}" || true
+            -d "$BODY" || true
 
   rollback:
     name: Rollback Production (manual)
