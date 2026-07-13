@@ -64,21 +64,13 @@ jobs:
           fi
 
           # ② 基於自身 trace_id 查鎖 (尋找是否有更早的 seq)
-          HTTP_LOCK=$(curl -sS --max-time 10 -o /tmp/lock.out -w '%{http_code}' \
+          HTTP_LOCK=$(curl -sS --max-time 10 --retry 2 -o /tmp/lock.out -w '%{http_code}' \
             -X GET "${CONTROLLER_URL%/}/lock?trace_id=$TRACE_ID" \
             -H "X-Trigger-Secret: $TRIGGER_SECRET") || HTTP_LOCK="000"
 
           if [[ "$HTTP_LOCK" == "409" ]]; then
             echo "::error::被更早的活躍任務鎖定。主動退讓以避免破壞環境。"
             cat /tmp/lock.out || true
-
-            # ③ 被拒的 trace 發送 pipeline_failed (死亡證明) 以釋放自己的佔用
-            FAIL_BODY=$(jq -nc --arg t "$TRACE_ID" \
-              '{trace_id:$t, action:"pipeline_failed", dispatch_ok:0, detail:"Preempted by older trace at lock check"}')
-            curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
-              -H "X-Trigger-Secret: $TRIGGER_SECRET" \
-              -H "Content-Type: application/json" \
-              -d "$FAIL_BODY" || true
             exit 1
           elif [[ ! "$HTTP_LOCK" =~ ^2 ]]; then
             echo "::error::查鎖失敗 (HTTP $HTTP_LOCK)。Fail-closed 啟動，中止。"
@@ -86,6 +78,16 @@ jobs:
           fi
 
           echo "鎖檢查通過，准許部署。"
+
+      # 🚨 新增：preflight 的終極安全網 — 任何失敗都發死亡證明
+      - name: Signal pipeline_failed (any preflight failure)
+        if: failure()
+        run: |
+          BODY=$(jq -nc --arg t "$TRACE_ID" \
+            '{trace_id:$t, action:"pipeline_failed", dispatch_ok:0, detail:"preflight aborted: locked by an older trace, or lock query failed"}')
+          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
+            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
+            -d "$BODY" || true
 
   test:
     name: Run Tests
@@ -194,6 +196,7 @@ jobs:
       
       # 【Patch 1】将 deploy 和 auto_rollback 从 bash || 中拆开，避免抢占时引发竞争回滚
       - name: Deploy Production
+        id: deploy_prod
         env:
           CLOUDFLARE_ENV: production
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -201,7 +204,7 @@ jobs:
         run: bash scripts/deploy.sh
         
       - name: Auto rollback on failure
-        if: failure() # 只有真失败才执行，被 cancel 抢占时求值为 false
+        if: failure() && steps.deploy_prod.outcome == 'failure'
         env:
           CLOUDFLARE_ENV: production
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -224,6 +227,15 @@ jobs:
           curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
             -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
             -d "$BODY" || true
+
+      # 🚨 新增：npm ci 等 deploy 前置步驟失敗時，不觸發回滾，改發死亡證明
+      - name: Signal pipeline_failed (died before prod deploy)
+        if: failure() && steps.deploy_prod.outcome != 'failure'
+        run: |
+          BODY=$(jq -nc --arg t "$TRACE_ID" \
+            '{trace_id:$t, action:"pipeline_failed", dispatch_ok:0, detail:"prod job failed before the deploy step ran (nothing was deployed)"}')
+          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
+            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" -d "$BODY" || true
 
   rollback:
     name: Rollback Production (manual)
