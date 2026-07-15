@@ -50,8 +50,13 @@ on:
         required: false
 
 env:
-  CONTROLLER_URL: ${{ secrets.CONTROLLER_URL }}
-  TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
+  # CONTROLLER_URL 是**公开** URL(workers.dev 子域,非机密)⇒ 用 repo 级 variable,不是 secret。
+  #   · 安全性靠 TRIGGER_SECRET:/audit、/lock 没有 X-Trigger-Secret 头一律拒。藏 URL 无防御价值。
+  #   · secret 会被 GitHub 在日志里打码成 ***,而 URL 供给正是要靠读 curl 输出来调 ⇒ 必须看得见。
+  #   ⚠️ 必须建成 **repository variable**(Settings ▸ Secrets and variables ▸ Actions ▸ Variables ▸ New)。
+  #      不能是 environment 级:preflight 没有 environment,顶层 env 读不到 environment 级变量。
+  CONTROLLER_URL: ${{ vars.CONTROLLER_URL }}
+  TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}   # 真凭证 —— 留 secret
   # push 事件没有 inputs.trace_id ⇒ push-<run_id>。
   # ⚠️「Re-run failed jobs」**复用同一个 run_id** ⇒ 同一个 TRACE_ID ⇒ 见 ②。
   TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
