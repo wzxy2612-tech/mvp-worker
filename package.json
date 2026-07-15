@@ -6,7 +6,8 @@
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "start": "wrangler dev",
-    "test": "vitest",
+    "test": "vitest run && npm run test:workflow",
+    "test:workflow": "vitest run --config vitest.config.node.mts",
     "typecheck": "tsc --noEmit",
     "cf-typegen": "wrangler types"
   },
@@ -16,7 +17,7 @@
     "@types/node": "^26.1.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.9",
-    "wrangler": "^4.107.0",
+    "wrangler": "^4.110.0",
     "yaml": "^2.9.0"
   }
 }

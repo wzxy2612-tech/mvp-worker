@@ -1,195 +1,119 @@
-#!/bin/bash
-# Task 5：自動回滾機制
+#!/usr/bin/env bash
+set -euo pipefail
+# scripts/rollback.sh ── V7
+# ═══════════════════════════════════════════════════════════════
+# 【V7 修的四件事】
+#
+# 1) 🔴 **「无历史版本」路径此前汇报成功。**
+#    v6:找不到可回滚的版本 → `emit_json_result "skipped_no_history"` → **dispatch_ok=1**
+#        → fold 成 **rolled_back**。
+#    ⇒ **回滚根本没发生,而审计说「已回滚」,而且是硬终态、append-only、改不回来。**
+#    ⇒ 这是最坏的一种谎:它发生在破窗通道上,发生在你最需要相信审计的那一刻。
+#    ⇒ 同时,`rollback_rejected` 这个 action 在**五本账里都声明着**(state.ts 的 Action、
+#      DeploymentState、CLOSING_ACTIONS、CALLBACK_ACTIONS、/audit 白名单)——
+#      **从来没有任何代码写过它。** 现在它真的会被写。
+#
+#    判据是 **≥ 2**,不是 ≥ 1:`wrangler deployments list` **包含当前版本**。
+#    只有 1 条 = 只有当前版本 = **没有可回退的目标**。
+#
+# 2) 🔴 **成功路径的静默洞。** v6:回滚成功 → send_audit_log 网络失败 → log_warn 吞掉 → exit 0。
+#    ⇒ 生产**已经回滚了**,D1 里**零事件** ⇒ 5 分钟后 reaper 写 timed_out(软终态,看着像例行公事)。
+#    现在:发射失败会 ::error:: 大声说出来(见 utils.sh 的政策说明)。
+#
+# 3) 🔴 **`${ROLLBACK_SOURCE:-auto_rollback}`。** 变量丢了 ⇒ **人工破窗被永久记录成机器自动回滚**。
+#    审计面对「谁按的按钮」撒谎。全部改成 require_env 硬失败。
+#
+# 4) 删掉 BACKUP_CONFIG 那段:它把一个文件 cp 进 runner 的临时工作区,然后 log
+#    「请另行部署」。**它什么都没做。** 一段读起来像在做事的死代码。
+# ═══════════════════════════════════════════════════════════════
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./utils.sh
 source "$SCRIPT_DIR/utils.sh"
 
-log_info "開始執行 Task 5: 自動回滾機制 (Automated Rollback)..."
+# ROLLBACK_SOURCE 必须是 auto_rollback | manual_rollback —— 这两个是 state.ts 里的
+# 独立 action,fold 出的硬终态相同(rolled_back),但**审计面靠它区分「谁按的按钮」**。
+require_env TARGET_ENV CONTROLLER_URL TRIGGER_SECRET TRACE_ID ROLLBACK_SOURCE ROLLBACK_MESSAGE || exit 1
 
-# ==============================================================================
-# 🎯 補盲區小鏟子：向控制面同步回滾審計日誌
-# ==============================================================================
-send_audit_log() {
-    local status_type="$1"
-    local msg="$2"
-    local disp_ok=0
-    local http_st=500
+case "$ROLLBACK_SOURCE" in
+  auto_rollback|manual_rollback) ;;
+  *)
+    log_error "ROLLBACK_SOURCE 非法:'${ROLLBACK_SOURCE}'(只能是 auto_rollback / manual_rollback)"
+    echo "::error::ROLLBACK_SOURCE 非法。拒绝伪造一个 action。"
+    exit 1
+    ;;
+esac
 
-    if [ "$status_type" = "completed" ]; then
-        disp_ok=1
-        http_st=200
-    elif [ "$status_type" = "skipped_no_history" ]; then
-        disp_ok=1
-        http_st=204
-    fi
+log_info "回滚目标环境:${TARGET_ENV} · 来源:${ROLLBACK_SOURCE}"
 
-    # 關鍵防禦：若環境變數未配，優雅跳過不卡死流水線
-    if [ -z "${CONTROLLER_URL:-}" ] || [ -z "${TRIGGER_SECRET:-}" ]; then
-        log_warn "未配置 CONTROLLER_URL 或 TRIGGER_SECRET，跳過向控制面發送審計通知。"
-        return 0
-    fi
+# ─────────────────────────────────────────────────────────────
+# ① 虚无回滚保护 —— 在动手之前,先确认**有东西可以回退**。
+#
+# wrangler 4.110 的 `deployments list --json` 返回扁平数组(已在真机核实)。
+# 数组**包含当前正在服役的版本** ⇒ 可回退 ⟺ length ≥ 2。
+# ─────────────────────────────────────────────────────────────
+set +e
+LIST_JSON=$(npx wrangler deployments list --env "$TARGET_ENV" --json 2>/tmp/wr_list_err)
+LIST_RC=$?
+set -e
 
-    log_info "正在向控制面同步回滾審計日誌 (${status_type})..."
+if [ "$LIST_RC" -ne 0 ]; then
+  log_error "无法列出 ${TARGET_ENV} 的部署历史 (rc=${LIST_RC})"
+  cat /tmp/wr_list_err >&2 || true
+  # 查不到历史 ≠ 没有历史。**fail-closed**:不硬猜,发硬终态、判红、叫人。
+  emit_event "$ROLLBACK_SOURCE" 0 "cannot list deployments for ${TARGET_ENV} (rc=${LIST_RC}) — refusing to guess" || true
+  echo "::error title=回滚失败::无法读取部署历史。**没有执行回滚。**需要人工介入。"
+  emit_json_result "failed" "deployments list failed" "$TARGET_ENV"
+  exit 2
+fi
 
-    # 利用 json_escape 安全處理 msg，避免 JSON 注入
-    local safe_msg
-    safe_msg=$(json_escape "$msg")
+COUNT=$(printf '%s' "$LIST_JSON" | jq 'length' 2>/dev/null || echo "0")
+log_info "${TARGET_ENV} 部署历史条数:${COUNT}(含当前版本)"
 
-    local payload
-    payload=$(cat <<EOF
-{
-  "action": "${ROLLBACK_SOURCE:-auto_rollback}",
-  "ref": "${CLOUDFLARE_ENV:-default}",
-  "trace_id": "${TRACE_ID:-}",
-  "dispatch_ok": $disp_ok,
-  "http_status": $http_st,
-  "detail": "$safe_msg"
-}
-EOF
-)
+if [ "$COUNT" -lt 2 ]; then
+  log_error "没有可回退的目标:历史只有 ${COUNT} 条(含当前版本)"
+  # ⚠️ 这里**不能**发 dispatch_ok=1。这不是「回滚成功」,是「回滚不可能」。
+  #    rollback_rejected 是独立硬终态,语义是:**没有任何东西被回退,而且这是确定的。**
+  emit_event rollback_rejected 0 "no rollback target: ${TARGET_ENV} has only ${COUNT} deployment(s)" || true
+  echo "::error title=回滚被拒::${TARGET_ENV} 没有可回退的历史版本。**生产维持现状。**"
+  emit_json_result "rejected" "no rollback target (${COUNT} deployments)" "$TARGET_ENV"
+  exit 1   # 判红。这是唯一诚实的结局。
+fi
 
-    local curl_out
-    curl_out=$(curl -s -w "\n%{http_code}" -X POST "${CONTROLLER_URL}/audit" \
-      -H "Content-Type: application/json" \
-      -H "X-Trigger-Secret: ${TRIGGER_SECRET}" \
-      --connect-timeout 5 --max-time 10 \
-      -d "$payload" 2>&1)
+# ─────────────────────────────────────────────────────────────
+# ② 执行回滚
+# ─────────────────────────────────────────────────────────────
+log_info "执行:wrangler rollback --env ${TARGET_ENV}"
 
-    local curl_status=$?
-    if [ $curl_status -eq 0 ]; then
-        local http_code
-        http_code=$(echo "$curl_out" | tail -n1)
-        log_info "控制面審計 API 響應狀態碼: $http_code"
-    else
-        log_warn "向控制面發送審計日誌失敗，curl 退出碼: $curl_status"
-    fi
-}
+set +e
+RB_OUTPUT=$(npx wrangler rollback --env "$TARGET_ENV" --message "$ROLLBACK_MESSAGE" --yes 2>&1)
+RB_RC=$?
+set -e
 
-# 用法：bash rollback.sh <PREVIOUS_VERSION_ID> <BACKUP_CONFIG_FILE>
-PREV_VERSION="${1:-}"
-BACKUP_CONFIG="${2:-}"
-# ==============================================================================
-# 🎯 修正點：打破審計「說謊」——優先採用傳入參數或環境變數，拒絕一律硬編碼
-# ==============================================================================
-DEFAULT_MSG="Automated rollback triggered by pipeline health gate"
+echo "$RB_OUTPUT"
 
-# 優先級：腳本第 3 個參數 > 環境變數 ROLLBACK_MESSAGE > 預設自動化健康檢查文案
-ROLLBACK_MSG="${3:-${ROLLBACK_MESSAGE:-$DEFAULT_MSG}}"
+if [ "$RB_RC" -ne 0 ]; then
+  log_error "wrangler rollback 失败 (rc=${RB_RC})"
+  # dispatch_ok=0 + auto/manual_rollback ⇒ fold 成 **rollback_failed**(硬终态)。
+  # 语义:灾难态,需人工介入。这正是它该说的话。
+  emit_event "$ROLLBACK_SOURCE" 0 "wrangler rollback FAILED (rc=${RB_RC}) on ${TARGET_ENV}" || true
+  echo "::error title=回滚失败::wrangler rollback 返回 ${RB_RC}。**生产可能仍处于坏版本。**立即人工介入。"
+  emit_json_result "failed" "wrangler rollback failed (rc=${RB_RC})" "$TARGET_ENV"
+  exit 2
+fi
 
-log_info "當前採用的回滾日誌訊息為: \"$ROLLBACK_MSG\""
-
-# ==============================================================================
-# 🎯 修正點 1：動態建構 Wrangler 環境參數 (對齊物理隔離環境)
-# ==============================================================================
-WRANGLER_ARGS=()
-if [ -n "$CLOUDFLARE_ENV" ]; then
-    log_info "偵測到目標環境變數 CLOUDFLARE_ENV: $CLOUDFLARE_ENV"
-    WRANGLER_ARGS+=("--env" "$CLOUDFLARE_ENV")
+# ─────────────────────────────────────────────────────────────
+# ③ 回滚成功 → rolled_back(硬终态)
+#
+# 发射失败不判红:生产**确实已经回滚了**,把这个 job 判红只会让人以为回滚没成。
+# 但 emit_event 会打 ::error:: 注解、且 reaper 的 5min deadline 会兜底成 timed_out。
+# 审计降级会大声说出来,而不是安静地长得像成功。(政策见 utils.sh 顶部。)
+# ─────────────────────────────────────────────────────────────
+if emit_event "$ROLLBACK_SOURCE" 1 "${TARGET_ENV} rolled back OK — ${ROLLBACK_MESSAGE}"; then
+  log_info "回滚完成,审计已落库。"
 else
-    log_warn "未指定 CLOUDFLARE_ENV，將嘗試對頂層預設環境進行操作..."
+  log_error "回滚**成功了**,但审计事件没落库 —— 审计面会把这条 trace 记成 timed_out。"
 fi
 
-log_info "啟動 Cloudflare 邊緣程式碼回滾程序..."
-
-# 1. Cloudflare 原生回滾
-# wrangler rollback 預設互動式（會問 y/n）。使用 --yes 跳過確認。
-if [ -n "$PREV_VERSION" ]; then
-    log_info "偵測到指定歷史版本 ID: $PREV_VERSION，嘗試精確回滾..."
-    ROLLBACK_OUTPUT=$(npx wrangler rollback "$PREV_VERSION" --message "$ROLLBACK_MSG" --yes "${WRANGLER_ARGS[@]}" 2>&1)
-else
-    log_info "未指定版本 ID，退回上一個穩定版本..."
-    ROLLBACK_OUTPUT=$(npx wrangler rollback --message "$ROLLBACK_MSG" --yes "${WRANGLER_ARGS[@]}" 2>&1)
-fi
-ROLLBACK_STATUS=$?
-
-# ==============================================================================
-# 🎯 修正點 2：關鍵防禦點升级——捕獲並識別「無歷史版本」的全新環境窄邊界
-# ==============================================================================
-if [ $ROLLBACK_STATUS -ne 0 ]; then
-    # 檢查 Wrangler 錯誤訊息中是否包含無歷史發布、找不到版本或只有單一版本的特徵
-    if echo "$ROLLBACK_OUTPUT" | grep -iqE "no.*deployment|not found|only one deployment|cannot rollback"; then
-        log_warn "⚠️ 【窄邊界命中】Cloudflare 回滾跳過：環境 '${CLOUDFLARE_ENV:-default}' 可能為全新建立，尚無足夠的歷史版本紀錄可供回退。"
-        echo "$ROLLBACK_OUTPUT"
-        
-        DATA_NO_HISTORY=$(cat <<EOF
-{
-  "status": "skipped_no_history",
-  "message": "Rollback skipped because the target environment has no previous deployment history to revert to.",
-  "wrangler_output": "No previous deployments found",
-  "environment_targeted": "${CLOUDFLARE_ENV:-default}"
-}
-EOF
-)
-        emit_json_result "true" "Rollback handled: No history available for environment '${CLOUDFLARE_ENV:-default}'." "$DATA_NO_HISTORY"
-
-        send_audit_log "skipped_no_history" "Rollback skipped: Target environment has no previous deployment history."
-
-        # 這是可預期的初始邊界，不讓流水線報紅崩潰，優雅退出
-        exit 0
-    fi
-
-    # 若非上述良性邊界，則判定為真正的硬性失敗（如網路崩潰、Token 失效等）
-    log_error "【緊急警告】Cloudflare 回滾操作硬性失敗！"
-    echo "$ROLLBACK_OUTPUT" >&2
-    DATA_CRITICAL=$(cat <<EOF
-{
-  "status": "critical_failure",
-  "message": "Rollback failed, manual intervention required",
-  "wrangler_error": "CLI execution error",
-  "environment_targeted": "${CLOUDFLARE_ENV:-default}"
-}
-EOF
-)
-    emit_json_result "false" "CRITICAL: Automated rollback collapsed. Edge state is unknown." "$DATA_CRITICAL"
-
-    send_audit_log "critical_failure" "CRITICAL: Automated rollback failed during wrangler execution."
-
-    exit 2
-fi
-
-log_info "Cloudflare 程式碼版本已成功撤回！"
-
-# 2. 還原配置檔快照（支援 jsonc / json / toml，與 backup.sh 對稱）
-CONFIG_RESTORED="false"
-if [ -n "$BACKUP_CONFIG" ] && [ -f "$BACKUP_CONFIG" ]; then
-    log_info "偵測到備份設定檔: $BACKUP_CONFIG，啟動配置還原..."
-    case "$BACKUP_CONFIG" in
-        *.jsonc|*.json)
-            cp "$BACKUP_CONFIG" ./wrangler.jsonc
-            CONFIG_RESTORED="true"
-            log_info "已還原 -> wrangler.jsonc"
-            ;;
-        *.toml)
-            cp "$BACKUP_CONFIG" ./wrangler.toml
-            CONFIG_RESTORED="true"
-            log_info "已還原 -> wrangler.toml"
-            ;;
-        *)
-            log_error "無法識別的備份設定檔格式，跳過配置還原: $BACKUP_CONFIG"
-            ;;
-    esac
-else
-    log_info "未提供或找不到設定檔快照，跳過配置還原。"
-fi
-
-# 說明：還原的是「本地」設定檔，供下次部署使用；
-if [ "$CONFIG_RESTORED" = "true" ]; then
-    log_info "提醒：本地設定檔已還原；若需讓路由／變數等配置生效，請於確認後另行部署。"
-fi
-
-# 3. 成功輸出
-log_info "自動回滾程序完成，程式碼已恢復至上一穩定版本。"
-
-send_audit_log "completed" "Rollback successfully executed and code reverted to the previous stable version."
-
-DATA_SUCCESS=$(cat <<EOF
-{
-  "status": "rollback_completed",
-  "required_action": "manual_review_code",
-  "previous_version_targeted": "${PREV_VERSION:-latest_stable}",
-  "environment_targeted": "${CLOUDFLARE_ENV:-default}",
-  "config_restored": $CONFIG_RESTORED,
-  "timestamp": $(date +%s)
-}
-EOF
-)
-emit_json_result "true" "System successfully recovered to the previous stable state." "$DATA_SUCCESS"
+emit_json_result "rolled_back" "$ROLLBACK_MESSAGE" "$TARGET_ENV"
+exit 0

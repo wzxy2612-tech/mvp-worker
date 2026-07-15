@@ -1,6 +1,37 @@
-name: MVP Worker CI/CD
+name: Deploy Pipeline
 
-# 【重要修正】移除了顶层的 concurrency 锁，避免 push 触发时踩空值
+# ══════════════════════════════════════════════════════════════════════
+# V7 —— 相对 v6 的四处结构改动
+#
+# ① 【步骤边界 = 部署边界】(拆除虚无回滚的引信)
+#    v6:npm test + tsc + wrangler deploy + 冒烟,全塞在 id=deploy_prod 一个 step 里,
+#        而 auto-rollback 守卫 `steps.deploy_prod.outcome == 'failure'`。
+#        ⇒ prod runner 上 vitest 抖一下 → **回滚一个健康的、根本没被动过的生产**,
+#          审计写 rolled_back。读起来完全合理、完全是假的。
+#    V7:上传(deploy_prod)与健康门(health_prod)是**两个 step**。
+#        回滚只认 health_prod.outcome —— 那才代表「新代码确实上去了」。
+#        `deploy_prod.outcome` **从所有守卫里彻底删除**。它就是骗了我们的那个信号。
+#
+# ② 【Self-check】deploy-staging / deploy-production 的第一步 GET /lock。
+#    一条 if 同时封死三个洞,而它们其实是同一个洞:
+#      · 被紧急回滚 superseded 的 deploy 继续跑完,把回滚掉的代码怼回生产
+#      · GitHub「Re-run failed jobs」复用同一 run_id ⇒ 同一 TRACE_ID ⇒ 硬终态已在库、
+#        seq 更小 ⇒ 新的 deploy_ok **永远盖不过它** ⇒ **生产是新代码,审计永久说 rolled_back**
+#      · 审批搁置到 reaper 写了 timed_out 之后才点「Approve」
+#    (政策已拍板:Re-run 一律 409。重跑请推新 commit。)
+#
+# ③ 【回滚 job 的死亡证明】v6:回滚 job 的 checkout / npm ci 挂 ⇒ **零事件** ⇒
+#    in_flight_rollback → 5min → timed_out(软终态,读起来像例行公事)。
+#    ⇒ 最坏的失败(紧急回滚**没跑**,而 in-flight 的 deploy 已经被 superseded 掉了)
+#      伪装成最平常的样子。V7 补 `if: failure()` → manual_rollback ok=0 → rollback_failed。
+#
+# ④ 【HEALTH_URL 显式声明】v6 从 wrangler 输出里 grep URL,第二条正则会匹配
+#    warning 里的 https://developers.cloudflare.com/... ⇒ **冒烟测试打 Cloudflare 文档站**
+#    ⇒ 200 ⇒ 绿 ⇒ deploy_ok。现在由本文件显式给出,并由 deploy.sh 与 wrangler 输出**对账**。
+#
+# ⚠️ 部署前请核对下面两个 HEALTH_URL 与实际 workers.dev 子域一致。
+#    猜错也不会静默:deploy.sh 的对账会**硬失败**、staging 判红、什么都不会 ship。
+# ══════════════════════════════════════════════════════════════════════
 
 on:
   push:
@@ -8,271 +39,302 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: "操作路由 (deploy: 走完整发版流 | rollback: 极速回滚)"
-        type: choice
+        description: "deploy | rollback"
         required: true
-        default: deploy
-        options:
-          - deploy
-          - rollback
-      confirm_rollback:
-        description: "【防误触】仅当 action 选 rollback 时，必须输入 YES_ROLLBACK"
-        type: string
-        required: false
-        default: ""
+        default: "deploy"
       trace_id:
-        description: "Correlation ID from control plane"
+        description: "控制面下发的 trace_id"
         required: false
-        type: string
-        default: ""
+      confirm_rollback:
+        description: "回滚必须填 YES_ROLLBACK"
+        required: false
 
-run-name: >-
-  ${{ github.event_name == 'workflow_dispatch' && format('部署分支/环境: {0} | 溯源ID: {1}', github.ref_name, inputs.trace_id || 'manual') || format('Push: {0}', github.sha) }}
+env:
+  CONTROLLER_URL: ${{ secrets.CONTROLLER_URL }}
+  TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
+  # push 事件没有 inputs.trace_id ⇒ push-<run_id>。
+  # ⚠️「Re-run failed jobs」**复用同一个 run_id** ⇒ 同一个 TRACE_ID ⇒ 见 ②。
+  TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
 
 jobs:
+  # ══════════════════════════════════════════════════════════════════
+  # preflight —— 出生 + 锁。顺序不可交换(ADR 012)。
+  # ══════════════════════════════════════════════════════════════════
   preflight:
-    name: Preflight & Lock Check
+    if: github.event.inputs.action != 'rollback'
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
-    env:
-      CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
-      TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
-      TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
-      RUN_ID: ${{ github.run_id }}
     steps:
-      # ① 無條件發出出生證明 (獲取數據庫 seq)
-      # ② 基於自身 trace_id 查 /lock (First-wins: min_seq 最小的活躍 trace 佔有鎖)
-      # ③ 如果被鎖，發死亡證明並自盡
-      - name: Emit pipeline_started & Lock Check
+      - uses: actions/checkout@v4
+
+      # ── ADR 009:出生事件必须**先于**锁检查 ──
+      #    /lock 的 seq-min 裁决要拿 MIN(id) 当 callerSeq。出生行还没落库 ⇒
+      #    callerSeq = Infinity ⇒ **任何**活跃 trace 都比我老 ⇒ 我永远输。
+      #    顺序颠倒 = 锁永久拒绝所有人。
+      #
+      #    这一步失败 ⇒ 整条 trace **没有出生事件** ⇒ 它在事件面上不存在 ⇒
+      #    不占锁、不被收割。这是**对的**:一条从未出生的 trace 不该锁住环境。
+      #    (也正因如此,ADR 011 要求审计面是 deploy 的硬依赖:发不出出生事件就别开始。)
+      - name: 🐣 出生事件 (pipeline_started)
+        run: bash scripts/emit.sh pipeline_started 1 "{\"run_id\":\"${{ github.run_id }}\",\"sha\":\"${{ github.sha }}\"}"
+
+      - name: 🔒 环境锁 (ADR 012 · seq-min 先到先得)
         run: |
-          set -euo pipefail
-
-          # ① 無條件發出出生證明 (獲取數據庫 seq)
-          BODY=$(jq -nc --arg t "$TRACE_ID" --arg r "$RUN_ID" \
-            '{trace_id:$t, action:"pipeline_started", dispatch_ok:1, detail:({run_id:$r}|tostring)}')
-
-          HTTP_START=$(curl -sS --max-time 10 --retry 2 -o /tmp/audit.out -w '%{http_code}' \
-            -X POST "${CONTROLLER_URL%/}/audit" \
-            -H "X-Trigger-Secret: $TRIGGER_SECRET" \
-            -H "Content-Type: application/json" \
-            -d "$BODY") || HTTP_START="000"
-
-          if [[ ! "$HTTP_START" =~ ^2 ]]; then
-            echo "::error::pipeline_started 未落庫 (HTTP $HTTP_START)。鎖失明，中止。"
-            cat /tmp/audit.out || true
-            exit 1
+          code=$(curl -sS --max-time 10 -o /tmp/lock.json -w '%{http_code}' \
+                    -H "X-Trigger-Secret: $TRIGGER_SECRET" \
+                    "${CONTROLLER_URL%/}/lock?trace_id=${TRACE_ID}")
+          echo "HTTP $code"; cat /tmp/lock.json; echo
+          [ "$code" = "200" ] && exit 0
+          if [ "$code" = "409" ]; then
+            echo "::error title=环境被锁::有更老的活跃 trace 正在占用环境。本次部署让路。"
+          else
+            echo "::error title=锁检查无法完成::控制面 /lock 返回 $code。**查不到锁 ≠ 没有锁** —— fail-closed。"
           fi
+          exit 1
 
-          # ② 基於自身 trace_id 查鎖 (尋找是否有更早的 seq)
-          HTTP_LOCK=$(curl -sS --max-time 10 --retry 2 -o /tmp/lock.out -w '%{http_code}' \
-            -X GET "${CONTROLLER_URL%/}/lock?trace_id=$TRACE_ID" \
-            -H "X-Trigger-Secret: $TRIGGER_SECRET") || HTTP_LOCK="000"
-
-          if [[ "$HTTP_LOCK" == "409" ]]; then
-            echo "::error::被更早的活躍任務鎖定。主動退讓以避免破壞環境。"
-            cat /tmp/lock.out || true
-            exit 1
-          elif [[ ! "$HTTP_LOCK" =~ ^2 ]]; then
-            echo "::error::查鎖失敗 (HTTP $HTTP_LOCK)。Fail-closed 啟動，中止。"
-            exit 1
-          fi
-
-          echo "鎖檢查通過，准許部署。"
-
-      # 🚨 新增：preflight 的終極安全網 — 任何失敗都發死亡證明
-      - name: Signal pipeline_failed (any preflight failure)
+      # 死亡证明:这一层网在 v6 里已经存在且正确,保留。
+      - name: ⚰️ 死亡证明 (pipeline_failed)
         if: failure()
-        run: |
-          BODY=$(jq -nc --arg t "$TRACE_ID" \
-            '{trace_id:$t, action:"pipeline_failed", dispatch_ok:0, detail:"preflight aborted: locked by an older trace, or lock query failed"}')
-          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
-            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
-            -d "$BODY" || true
+        run: bash scripts/emit.sh pipeline_failed 0 "preflight failed"
 
+      - name: ⚰️ 死亡证明 (cancelled)
+        if: cancelled()
+        env:
+          EMIT_MAX_TIME: "3"
+          EMIT_RETRIES: "0"
+        run: bash scripts/emit.sh cancelled 0 "preflight cancelled"
+
+  # ══════════════════════════════════════════════════════════════════
+  # test —— 全流水线**唯一**跑 npm test / tsc 的地方
+  # ══════════════════════════════════════════════════════════════════
   test:
-    name: Run Tests
     needs: preflight
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
-    env:
-      CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
-      TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
-      TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '22' }
+        with:
+          node-version: '22'
+          cache: npm
       - run: npm ci
-      - run: npm test
 
-      - name: Signal pipeline_failed
+      - name: Typecheck
+        run: npm run typecheck
+
+      # ⚠️ package.json 的 "test" 现在链了 test:workflow。
+      #    v6:"test": "vitest"(Workers pool,**没有文件系统**)
+      #        "test:workflow": "vitest run --config vitest.config.node.mts"(node pool)
+      #        而 CI 只跑 npm test ⇒ **workflow.spec.ts 的 17 条不变量从未在 CI 里跑过。**
+      #        它的文件头写着「搬进 npm test 的额外收益:每次 push 自动跑」—— 这句话没成立。
+      #        (那 17 条里就包括「auto-rollback 必须带守卫」—— 虚无回滚的唯一看门人,
+      #         而看门人自己没上班。)
+      - name: Unit + YAML 结构不变量
+        run: npm test
+
+      - name: ⚰️ 死亡证明 (pipeline_failed)
         if: failure()
-        run: |
-          BODY=$(jq -nc --arg t "$TRACE_ID" \
-            '{trace_id:$t, action:"pipeline_failed", dispatch_ok:0, detail:"test/npm ci failed before any deploy"}')
-          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
-            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
-            -d "$BODY" || true
+        run: bash scripts/emit.sh pipeline_failed 0 "test job failed"
 
-      - name: Signal cancelled
+      - name: ⚰️ 死亡证明 (cancelled)
         if: cancelled()
-        run: |
-          BODY=$(jq -nc --arg t "$TRACE_ID" \
-            '{trace_id:$t, action:"cancelled", dispatch_ok:0, detail:"test job cancelled"}')
-          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
-            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
-            -d "$BODY" || true
+        env:
+          EMIT_MAX_TIME: "3"
+          EMIT_RETRIES: "0"
+        run: bash scripts/emit.sh cancelled 0 "test job cancelled"
 
+  # ══════════════════════════════════════════════════════════════════
+  # deploy-staging
+  # ══════════════════════════════════════════════════════════════════
   deploy-staging:
-    name: Deploy to Staging
     needs: test
     runs-on: ubuntu-latest
     environment: staging
-    # 【Patch 2】Staging 也要串行，防止裸奔和批量制造 ghost gate_waiting
     concurrency:
       group: staging-deploy
       cancel-in-progress: false
     env:
-      CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
-      TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
-      TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
-    if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
+      TARGET_ENV: staging
+      HEALTH_URL: https://mvp-worker-staging.my-mvp-worker.workers.dev/health
     steps:
+      # Self-check 放在 checkout 之前:它只要 curl + jq,ubuntu-latest 自带。
+      - name: 🔒 Self-check —— 我自己是不是已经终态了?
+        run: |
+          code=$(curl -sS --max-time 10 -o /tmp/lock.json -w '%{http_code}' \
+                    -H "X-Trigger-Secret: $TRIGGER_SECRET" \
+                    "${CONTROLLER_URL%/}/lock?trace_id=${TRACE_ID}")
+          echo "HTTP $code"; cat /tmp/lock.json; echo
+          [ "$code" = "200" ] && exit 0
+          if [ "$code" = "409" ]; then
+            echo "::error title=Self-check 409::本 trace 已是硬终态(被 superseded / 已 Re-run 过 / 已 timed_out),或被更老的 trace 持锁。中止,以免僵尸部署。"
+          else
+            echo "::error title=Self-check 无法完成::/lock 返回 $code。查不到锁 ≠ 没有锁。fail-closed。"
+          fi
+          exit 1
+
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '22' }
+        with:
+          node-version: '22'
+          cache: npm
       - run: npm ci
-      - name: Deploy Staging
+
+      - name: 🚀 上传 staging
+        id: deploy_stg
         env:
-          CLOUDFLARE_ENV: staging
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: bash scripts/deploy.sh
 
-      - name: Signal pipeline_failed
+      - name: 🩺 健康门 staging
+        id: health_stg
+        run: bash scripts/health-gate.sh
+        # 通过 ⇒ gate_passed ⇒ gate_waiting(等审批)
+
+      - name: ⚰️ 死亡证明 (pipeline_failed)
         if: failure()
-        run: |
-          BODY=$(jq -nc --arg t "$TRACE_ID" \
-            '{trace_id:$t, action:"pipeline_failed", dispatch_ok:0, detail:"staging deploy failed before reaching production"}')
-          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
-            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
-            -d "$BODY" || true
+        run: bash scripts/emit.sh pipeline_failed 0 "staging stage failed"
 
-      - name: Signal cancelled
+      - name: ⚰️ 死亡证明 (cancelled)
         if: cancelled()
-        run: |
-          BODY=$(jq -nc --arg t "$TRACE_ID" \
-            '{trace_id:$t, action:"cancelled", dispatch_ok:0, detail:"staging job cancelled"}')
-          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
-            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
-            -d "$BODY" || true
+        env:
+          EMIT_MAX_TIME: "3"
+          EMIT_RETRIES: "0"
+        run: bash scripts/emit.sh cancelled 0 "staging stage cancelled"
 
+  # ══════════════════════════════════════════════════════════════════
+  # deploy-production —— 人工审批门在 environment: production 上
+  # ══════════════════════════════════════════════════════════════════
   deploy-production:
-    name: Deploy to Production
     needs: deploy-staging
     runs-on: ubuntu-latest
     environment: production
-    env:
-      CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
-      TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
-      TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
-    if: github.event_name == 'push' || github.event.inputs.action == 'deploy'
-    # 并发驱逐锁。cancel-in-progress: false 下 GitHub 的默认行为是 queue: single —
-    # 后来者不会强杀先来者,但当先来者自然结束后,队列里的下一个立即顶上。
-    # 注意这并非"老实排队",late-arriving waiter 会抢占最早 waiter 的执行权。
     concurrency:
       group: production-deploy
-      cancel-in-progress: false
+      # 🔴 修复点：已删除 cancel-in-progress: true
+    env:
+      TARGET_ENV: production
+      HEALTH_URL: https://mvp-worker-production.my-mvp-worker.workers.dev/health
     steps:
+      # 审批可能搁置任意久。这段时间里可能发生:紧急回滚(→ superseded)、
+      # reaper 超时(→ timed_out)、有人 Re-run 了这个 run(→ 硬终态已在库)。
+      # ⇒ 审批通过后的**第一件事**必须是问控制面:我还有资格上生产吗?
+      - name: 🔒 Self-check —— 审批之后、动生产之前
+        run: |
+          code=$(curl -sS --max-time 10 -o /tmp/lock.json -w '%{http_code}' \
+                    -H "X-Trigger-Secret: $TRIGGER_SECRET" \
+                    "${CONTROLLER_URL%/}/lock?trace_id=${TRACE_ID}")
+          echo "HTTP $code"; cat /tmp/lock.json; echo
+          [ "$code" = "200" ] && exit 0
+          if [ "$code" = "409" ]; then
+            echo "::error title=Self-check 409::本 trace 已是硬终态。**拒绝把一个已被判定终局的部署推上生产。**"
+          else
+            echo "::error title=Self-check 无法完成::/lock 返回 $code。fail-closed。"
+          fi
+          exit 1
+
+      - name: 🏁 prod_started
+        run: bash scripts/emit.sh prod_started 1 "approved, starting production deploy"
+
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '22' }
+        with:
+          node-version: '22'
+          cache: npm
       - run: npm ci
-      - name: Signal prod_started
-        run: |
-          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
-            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
-            -d "{\"trace_id\":\"$TRACE_ID\",\"action\":\"prod_started\",\"dispatch_ok\":1,\"detail\":\"approved, deploying prod\"}" || true
-      
-      # 【Patch 1】将 deploy 和 auto_rollback 从 bash || 中拆开，避免抢占时引发竞争回滚
-      - name: Deploy Production
+
+      # ── 上传。失败 ⇒ **什么都没部署** ⇒ 绝不回滚。 ──
+      - name: 🚀 上传 production
         id: deploy_prod
         env:
-          CLOUDFLARE_ENV: production
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: bash scripts/deploy.sh
-        
-      - name: Auto rollback on failure
-        if: failure() && steps.deploy_prod.outcome == 'failure'
+
+      # ── 健康门。能跑到这里 ⇒ 新代码**确实在生产上** ⇒ 这里失败,回滚是有意义的。 ──
+      - name: 🩺 健康门 production
+        id: health_prod
+        run: bash scripts/health-gate.sh
+
+      # ══ 回滚守卫 ══
+      # health_prod.outcome == 'failure'
+      #   ⟺ 上传成功了(否则这个 step 是 skipped)且健康门挂了
+      #   ⟺ **生产上确实是新的坏代码**
+      # 这是**唯一**能推出「回滚是有意义的」的信号。
+      # ⛔ 绝不再用 steps.deploy_prod.outcome —— 它把「什么都没部署」也算成 failure。
+      - name: 🔙 自动回滚(仅当健康门在一次成功的上传之后失败)
+        if: failure() && steps.health_prod.outcome == 'failure'
         env:
-          CLOUDFLARE_ENV: production
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
-          TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
-          TRACE_ID: ${{ github.event.inputs.trace_id || format('push-{0}', github.run_id) }}
+          ROLLBACK_SOURCE: auto_rollback
           ROLLBACK_MESSAGE: "Auto rollback: production health gate failed"
-          ROLLBACK_SOURCE: "auto_rollback"
-        run: |
-          echo "::error::部署或健康检查失败，正在触发回滚..."
-          bash scripts/rollback.sh
+        run: bash scripts/rollback.sh
 
-      - name: Signal cancelled
+      # 与上一步**互斥且穷尽**地覆盖 failure():
+      #   Self-check 挂 / prod_started 发不出 / npm ci 挂 / **wrangler deploy 上传失败**
+      #   ⇒ health_prod = skipped ⇒ outcome != 'failure' ⇒ 走这里,**不回滚**。
+      #   (v6 的 `if: failure()` 会把 npm ci 失败也变成一次生产回滚。)
+      - name: ⚰️ 死亡证明 (pipeline_failed · 未部署,不回滚)
+        if: failure() && steps.health_prod.outcome != 'failure'
+        run: bash scripts/emit.sh pipeline_failed 0 "production stage died before/at upload — nothing deployed"
+
+      - name: ⚰️ 死亡证明 (cancelled)
         if: cancelled()
-        run: |
-          # 取消硬编码的抢占理由，改为更诚实的描述
-          BODY=$(jq -nc --arg t "$TRACE_ID" \
-            '{trace_id:$t, action:"cancelled", dispatch_ok:0, detail:"job cancelled while running (preemption or manual)"}')
-          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
-            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
-            -d "$BODY" || true
+        env:
+          EMIT_MAX_TIME: "3"
+          EMIT_RETRIES: "0"
+        run: bash scripts/emit.sh cancelled 0 "production stage cancelled (likely preempted by emergency rollback)"
 
-      # 🚨 新增：npm ci 等 deploy 前置步驟失敗時，不觸發回滾，改發死亡證明
-      - name: Signal pipeline_failed (died before prod deploy)
-        if: failure() && steps.deploy_prod.outcome != 'failure'
-        run: |
-          BODY=$(jq -nc --arg t "$TRACE_ID" \
-            '{trace_id:$t, action:"pipeline_failed", dispatch_ok:0, detail:"prod job failed before the deploy step ran (nothing was deployed)"}')
-          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
-            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" -d "$BODY" || true
-
+  # ══════════════════════════════════════════════════════════════════
+  # rollback —— 破窗通道
+  #
+  # ⚠️ environment: production-rollback 上**绝不能**有 required_reviewers。
+  #    破窗通道被审批门挡住 = 破窗通道不存在。
+  #    这条约束在 git diff 里**完全不可见**(它是 GitHub 的服务端设置)⇒
+  #    verify-system.sh 的 D 段专门查它。
+  #
+  # concurrency: production-deploy + cancel-in-progress ⇒ 抢占正在跑的 prod 部署。
+  # 但**抢不到还在 staging-deploy 组里的 deploy** —— 那条路由 /rollback 的
+  # superseded 预写 + deploy-production 的 Self-check 封死(见 ②)。
+  # 并发组管不到的地方,事件面管得到。
+  # ══════════════════════════════════════════════════════════════════
   rollback:
-    name: Rollback Production (manual)
+    if: github.event.inputs.action == 'rollback' && github.event.inputs.confirm_rollback == 'YES_ROLLBACK'
     runs-on: ubuntu-latest
-    # 追加了 event_name 判断，彻底杜绝 push 事件意外解析该逻辑的可能性
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'rollback' && github.event.inputs.confirm_rollback == 'YES_ROLLBACK' }}
     environment: production-rollback
-    # Job 级别的抢占锁（救护车：强制踢掉同组正在运行的部署任务）
     concurrency:
       group: production-deploy
       cancel-in-progress: true
+    env:
+      TARGET_ENV: production
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '22' }
+        with:
+          node-version: '22'
+          cache: npm
       - run: npm ci
-      - name: Rollback
+
+      - name: 🔙 执行回滚
         env:
-          CLOUDFLARE_ENV: production
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
-          TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
-          # 【Patch 3 附带】修改回滚兜底 trace_id 为 rollback-{0}
-          TRACE_ID: ${{ github.event.inputs.trace_id || format('rollback-{0}', github.run_id) }}
-          ROLLBACK_SOURCE: "manual_rollback"
-          ROLLBACK_MESSAGE: "Manual rollback via control plane"
+          ROLLBACK_SOURCE: manual_rollback
+          ROLLBACK_MESSAGE: "Manual break-glass rollback via control plane"
         run: bash scripts/rollback.sh
-        
-      # 【Patch 3】防止第二个回滚抢占第一个回滚时产生静默 ghost
-      - name: Signal cancelled
+
+      # 【V7 新增】v6 这里**什么网都没有**。
+      # checkout / setup-node / npm ci 任一失败 ⇒ 零事件 ⇒ in_flight_rollback → 5min
+      # → timed_out(**软**终态,在审计面上读起来像例行公事)。
+      # ⇒ 整个系统最坏的一种失败 —— 紧急回滚**没跑**,而 /rollback 已经把所有 in-flight
+      #   的 deploy 都 superseded 掉了 —— 伪装成最平常的一种。
+      # manual_rollback + ok=0 ⇒ fold 成 **rollback_failed**(硬终态,语义:灾难态,需人工介入)。
+      - name: ⚰️ 死亡证明 (rollback_failed)
+        if: failure()
+        run: bash scripts/emit.sh manual_rollback 0 "rollback job failed before/outside rollback.sh — MANUAL INTERVENTION REQUIRED"
+
+      - name: ⚰️ 死亡证明 (cancelled)
         if: cancelled()
         env:
-          CONTROLLER_URL: "https://mvp-ci-controller.my-mvp-worker.workers.dev"
-          TRIGGER_SECRET: ${{ secrets.TRIGGER_SECRET }}
-          TRACE_ID: ${{ github.event.inputs.trace_id || format('rollback-{0}', github.run_id) }}
-        run: |
-          curl -sS --max-time 10 -X POST "${CONTROLLER_URL%/}/audit" \
-            -H "X-Trigger-Secret: $TRIGGER_SECRET" -H "Content-Type: application/json" \
-            -d "{\"trace_id\":\"$TRACE_ID\",\"action\":\"cancelled\",\"dispatch_ok\":0,\"detail\":\"rollback job cancelled (preempted by a newer rollback)\"}" || true
+          EMIT_MAX_TIME: "3"
+          EMIT_RETRIES: "0"
+        run: bash scripts/emit.sh cancelled 0 "rollback job cancelled"
