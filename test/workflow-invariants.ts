@@ -290,7 +290,7 @@ describe("⑤ 出生 / 锁 / 破窗", () => {
   });
 
   it("⛔ 没有 workflow 级 concurrency —— 它会把 rollback 拉进同组**排队**,永久拆掉抢占", () => {
-    expect((WF as Record<string, unknown>).concurrency).toBeUndefined();
+    expect((WF as unknown as Record<string, unknown>).concurrency).toBeUndefined();
   });
 
   it("production-deploy 组恰好 2 个成员:deploy-production + rollback", () => {
