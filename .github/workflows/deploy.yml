@@ -236,10 +236,21 @@ jobs:
           fi
           exit 1
 
+      # checkout 必须早于 prod_started:prod_started 调 scripts/emit.sh,而 emit.sh
+      # 要 checkout 之后才在盘上。原来 checkout 在其后 ⇒ prod_started 127(No such file);
+      # 且 checkout 是普通 step,prod_started 一挂它就被**跳过** ⇒ 连 pipeline_failed
+      # 死亡证明也 127 ⇒ prod 阶段**零事件**,事件面看不见这次失败。
+      # (deploy-staging 早就是 Self-check → checkout → … 的顺序;这里只是把 prod_started
+      #  从 checkout 前挪到后,让 prod 与 staging 的已验证形态对齐。)
+      - uses: actions/checkout@v4
+
       - name: 🏁 prod_started
         run: bash scripts/emit.sh prod_started 1 "approved, starting production deploy"
 
-      - uses: actions/checkout@v4
+      # ⚠️ setup-node / npm ci 刻意**留在 prod_started 之后**:
+      #    Drill C(审批后让 prod 的 npm ci 挂)要求事件序列 = prod_started → pipeline_failed。
+      #    若把 prod_started 挪到 npm ci 之后,npm ci 一挂就只有 pipeline_failed、无 prod_started
+      #    ⇒ 破坏 Drill C。prod_started 只用 bash/curl/jq(runner 自带)+ scripts/,不需要 node。
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

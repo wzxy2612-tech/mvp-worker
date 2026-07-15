@@ -344,3 +344,26 @@ describe("⑦ package.json —— workflow.spec.ts 必须真的在 CI 里跑", (
     expect(t, '"test" 必须用 vitest run,不能用裸 vitest(watch 模式)').toContain("vitest run");
   });
 });
+
+// ═════════════════════════════════════════════════════════════════
+describe("⑧ 运行时文件系统事实 —— scripts/ 必须位于 checkout 之后", () => {
+  it("所有包含 scripts/ 的 run step 都必须在 checkout 之后执行", () => {
+    for (const [name, j] of Object.entries(WF.jobs)) {
+      const stepsList = j.steps ?? [];
+      const iCheckout = stepsList.findIndex((s) => (s.uses ?? "").includes("actions/checkout"));
+
+      // 如果 job 根本没 checkout，那它肯定跑不了 scripts/
+      if (iCheckout === -1) continue;
+
+      for (const s of stepsList) {
+        if ((s.run ?? "").includes("scripts/")) {
+          const iScript = stepsList.indexOf(s);
+          expect(
+            iScript,
+            `job=${name} step="${s.name ?? s.id}" 试图在 checkout 之前运行 ${s.run}`
+          ).toBeGreaterThan(iCheckout);
+        }
+      }
+    }
+  });
+});
