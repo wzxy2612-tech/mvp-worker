@@ -46,7 +46,14 @@ on:
         description: "控制面下发的 trace_id"
         required: false
       confirm_rollback:
-        description: "回滚必须填 YES_ROLLBACK"
+        description: "prod 破窗填 YES_ROLLBACK;drill 演练填 YES_ROLLBACK_DRILL(字面量即目标选择器)"
+        required: false
+      # ── drill 演练参数(push 时这些 input 不存在 ⇒ 表达式里恒为空 ⇒ 全部落 prod 分支)──
+      target_env:
+        description: "留空=正常 staging→prod;填 'drill'=只打 drill-env(演练 E/F/G 的部署侧)"
+        required: false
+      deploy_var_override:
+        description: "仅 drill 生效:注入 wrangler --var,如 'HEALTH_MODE:broken'(演练 E)。prod 路径由 deploy.sh 结构性忽略"
         required: false
 
 env:
@@ -151,6 +158,9 @@ jobs:
   # ══════════════════════════════════════════════════════════════════
   deploy-staging:
     needs: test
+    # drill 不跑晋级链:target_env=='drill' 时跳过 staging,直接由 deploy-production 打 drill。
+    # push / 控制面 deploy 派发(target_env 空)⇒ '' != 'drill' ⇒ 照常跑。
+    if: github.event.inputs.target_env != 'drill'
     runs-on: ubuntu-latest
     environment: staging
     concurrency:
@@ -210,14 +220,27 @@ jobs:
   # ══════════════════════════════════════════════════════════════════
   deploy-production:
     needs: deploy-staging
+    # ── 决策 1:drill 的 job 图 ──
+    # prod 只在「staging 成功」或「这是 drill」时跑。always() 让 drill 下被跳过的 staging
+    # 不把本 job 一起跳掉;括号内条件保证:push/控制面部署时 staging 失败 ⇒ **prod 不跑**。
+    # ⚠️ 不 gate github.event_name=='push':控制面用 workflow_dispatch(带 trace_id)派发 prod 部署,
+    #    gate event_name 会把控制面部署一起挡掉。只按 target_env + staging 结果判。
+    # ⚠️ 这行由 workflow-invariants ⑨ 钉死:必须含 always()、needs.deploy-staging.result == 'success'、
+    #    target_env == 'drill' 三者 —— 少一个都可能让 staging 失败却直通 prod。
+    if: ${{ always() && (github.event.inputs.target_env == 'drill' || needs.deploy-staging.result == 'success') }}
     runs-on: ubuntu-latest
-    environment: production
+    # target_env=='drill' ⇒ drill-env-prod(无审批);否则 production(带人工审批门)。
+    environment: ${{ github.event.inputs.target_env == 'drill' && 'drill-env-prod' || 'production' }}
     concurrency:
-      group: production-deploy
-      # 🔴 修复点：已删除 cancel-in-progress: true
+      # 决策 2 的另一半:drill 用独立组 drill-deploy ⇒ drill 回滚抢占不到在飞的 prod 部署。
+      group: ${{ github.event.inputs.target_env == 'drill' && 'drill-deploy' || 'production-deploy' }}
+      # 仍无 cancel-in-progress —— 全文件只有 rollback 一个抢占者(invariant ⑤ 非对称锁)。
     env:
-      TARGET_ENV: production
-      HEALTH_URL: https://mvp-worker-production.my-mvp-worker.workers.dev/health
+      TARGET_ENV: ${{ github.event.inputs.target_env == 'drill' && 'drill' || 'production' }}
+      HEALTH_URL: ${{ github.event.inputs.target_env == 'drill' && 'https://mvp-worker-drill.my-mvp-worker.workers.dev/health' || 'https://mvp-worker-production.my-mvp-worker.workers.dev/health' }}
+      # 决策 3:注入仅在「drill 且显式给了 override」时透传;prod 路径恒为空
+      # (deploy.sh 再忽略一层,index.ts 的 ENVIRONMENT!=='production' 门是第三层)。
+      DEPLOY_VAR_OVERRIDE: ${{ github.event.inputs.target_env == 'drill' && github.event.inputs.deploy_var_override || '' }}
     steps:
       # 审批可能搁置任意久。这段时间里可能发生:紧急回滚(→ superseded)、
       # reaper 超时(→ timed_out)、有人 Re-run 了这个 run(→ 硬终态已在库)。
@@ -314,14 +337,19 @@ jobs:
   # 并发组管不到的地方,事件面管得到。
   # ══════════════════════════════════════════════════════════════════
   rollback:
-    if: github.event.inputs.action == 'rollback' && github.event.inputs.confirm_rollback == 'YES_ROLLBACK'
+    # ── 决策 2:confirm 字面量 = 目标选择器 ──
+    # prod 契约零改动(仍 YES_ROLLBACK);drill 用新字面量 YES_ROLLBACK_DRILL。
+    # job 只接受这两个之一;下面 environment/TARGET_ENV/组全由「命中哪个」决定:
+    #   YES_ROLLBACK_DRILL ⇒ 全 drill;否则(必是 YES_ROLLBACK)⇒ 全 prod。
+    # ⇒ drill 字面量**物理上打不到 prod**,没有第二个字段能手滑填错。
+    if: github.event.inputs.action == 'rollback' && (github.event.inputs.confirm_rollback == 'YES_ROLLBACK' || github.event.inputs.confirm_rollback == 'YES_ROLLBACK_DRILL')
     runs-on: ubuntu-latest
-    environment: production-rollback
+    environment: ${{ github.event.inputs.confirm_rollback == 'YES_ROLLBACK_DRILL' && 'drill-env-rollback' || 'production-rollback' }}
     concurrency:
-      group: production-deploy
+      group: ${{ github.event.inputs.confirm_rollback == 'YES_ROLLBACK_DRILL' && 'drill-deploy' || 'production-deploy' }}
       cancel-in-progress: true
     env:
-      TARGET_ENV: production
+      TARGET_ENV: ${{ github.event.inputs.confirm_rollback == 'YES_ROLLBACK_DRILL' && 'drill' || 'production' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

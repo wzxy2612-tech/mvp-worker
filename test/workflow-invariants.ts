@@ -71,6 +71,104 @@ const stepById = (n: string, id: string): Step | undefined => steps(n).find((s) 
 const stepsWithRun = (n: string, needle: string): Step[] =>
   steps(n).filter((s) => (s.run ?? "").includes(needle));
 
+// ═══════════════════════════════════════════════════════════════════
+// 迷你 GitHub 表达式求值器 —— drill 参数化后,④/⑤ 里若干断言的目标从字面
+// `production` 变成了 `${{ ... }}` 表达式。**不 grep 表达式字符串**(那是「用
+// grep 验结构化文档 = 第二本账」);按 GH 的 &&/|| **返回操作数**语义,对每个
+// 场景 resolve 出具体值,再比字面量。逻辑已用 Python 复刻对 deploy.yml 跑绿。
+//
+//   GH 语义:A && B → A 真则 B 否则 A;A || B → A 真则 A 否则 B(短路返回操作数)
+//   真值:'' 假、非空串真、true/false 原样。优先级:== / != > && > ||,括号覆盖。
+//   always() → true。裸字面量(非 ${{}} 包裹)原样返回;`if:` 例外(GH 隐式求值)。
+// ═══════════════════════════════════════════════════════════════════
+type Ctx = Record<string, string>;
+type Val = string | boolean;
+const LOOKUP: Record<string, string> = {
+  "github.event.inputs.target_env": "target_env",
+  "github.event.inputs.confirm_rollback": "confirm_rollback",
+  "github.event.inputs.action": "action",
+  "github.event.inputs.deploy_var_override": "deploy_var_override",
+  "needs.deploy-staging.result": "staging_result",
+};
+const truthy = (v: Val): boolean => (typeof v === "boolean" ? v : v !== "");
+type Tok = { k: string; v: string };
+function tokenize(s: string): Tok[] {
+  const t: Tok[] = [];
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === "'") { const j = s.indexOf("'", i + 1); t.push({ k: "STR", v: s.slice(i + 1, j) }); i = j + 1; continue; }
+    const two = s.slice(i, i + 2);
+    if (two === "==" || two === "!=" || two === "&&" || two === "||") { t.push({ k: "OP", v: two }); i += 2; continue; }
+    if (c === "(") { t.push({ k: "LP", v: c }); i++; continue; }
+    if (c === ")") { t.push({ k: "RP", v: c }); i++; continue; }
+    const m = /^[A-Za-z_][A-Za-z0-9_.\-]*/.exec(s.slice(i));
+    if (m) { t.push({ k: "ID", v: m[0] }); i += m[0].length; continue; }
+    throw new Error(`bad char ${c} in ${s}`);
+  }
+  return t;
+}
+class ExprParser {
+  private i = 0;
+  constructor(private t: Tok[], private ctx: Ctx) {}
+  private peek(): Tok { return this.t[this.i] ?? { k: "", v: "" }; }
+  private next(): Tok { return this.t[this.i++]; }
+  or(): Val {
+    let l = this.and();
+    while (this.peek().k === "OP" && this.peek().v === "||") { this.next(); const r = this.and(); l = truthy(l) ? l : r; }
+    return l;
+  }
+  private and(): Val {
+    let l = this.cmp();
+    while (this.peek().k === "OP" && this.peek().v === "&&") { this.next(); const r = this.cmp(); l = truthy(l) ? r : l; }
+    return l;
+  }
+  private cmp(): Val {
+    const l = this.prim();
+    const p = this.peek();
+    if (p.k === "OP" && (p.v === "==" || p.v === "!=")) {
+      this.next(); const r = this.prim(); const eq = l === r; return p.v === "==" ? eq : !eq;
+    }
+    return l;
+  }
+  private prim(): Val {
+    const tk = this.next();
+    if (tk.k === "LP") { const r = this.or(); if (this.next().k !== "RP") throw new Error("expected )"); return r; }
+    if (tk.k === "STR") return tk.v;
+    if (tk.k === "ID") {
+      if (tk.v === "always" && this.peek().k === "LP") { this.next(); this.next(); return true; }
+      if (tk.v in LOOKUP) return this.ctx[LOOKUP[tk.v]] ?? "";
+      throw new Error(`unknown path ${tk.v}`);
+    }
+    throw new Error(`unexpected ${tk.k}`);
+  }
+}
+function resolveExpr(expr: string, ctx: Ctx, isIf = false): Val {
+  const s = String(expr).trim();
+  const wrapped = s.startsWith("${{") && s.endsWith("}}");
+  let inner: string;
+  if (wrapped) inner = s.slice(3, -2).trim();
+  else if (isIf) inner = s;
+  else return expr; // 裸字面量原样返回
+  return new ExprParser(tokenize(inner), ctx).or();
+}
+const grp = (j: Job, ctx: Ctx): string | null => {
+  const g = j.concurrency?.group;
+  return g === undefined ? null : (resolveExpr(g, ctx) as string);
+};
+// 场景上下文(push 时 inputs 不存在 ⇒ 字段恒为空)
+const SC: Record<string, Ctx> = {
+  push:           { target_env: "", confirm_rollback: "", action: "", deploy_var_override: "", staging_result: "success" },
+  push_stg_fail:  { target_env: "", confirm_rollback: "", action: "", deploy_var_override: "", staging_result: "failure" },
+  ctrl_deploy:    { target_env: "", confirm_rollback: "", action: "deploy", deploy_var_override: "", staging_result: "success" },
+  drill_deploy:   { target_env: "drill", confirm_rollback: "", action: "deploy", deploy_var_override: "", staging_result: "skipped" },
+  drill_deploy_E: { target_env: "drill", confirm_rollback: "", action: "deploy", deploy_var_override: "HEALTH_MODE:broken", staging_result: "skipped" },
+  prod_rb:        { target_env: "", confirm_rollback: "YES_ROLLBACK", action: "rollback", deploy_var_override: "", staging_result: "skipped" },
+  drill_rb:       { target_env: "", confirm_rollback: "YES_ROLLBACK_DRILL", action: "rollback", deploy_var_override: "", staging_result: "skipped" },
+  bogus_rb:       { target_env: "", confirm_rollback: "YES", action: "rollback", deploy_var_override: "", staging_result: "skipped" },
+};
+
 // ═════════════════════════════════════════════════════════════════
 describe("① 步骤边界 = 部署边界 —— 虚无回滚的引信", () => {
   // 这一组是整个文件的核心。v6 的 bug 是**步骤边界画错了位置**:
@@ -220,20 +318,30 @@ describe("④ 单一账本 —— 变量、URL、机制", () => {
     expect(bad, `CLOUDFLARE_ENV 出现在:${bad.join(", ")}`).toHaveLength(0);
   });
 
-  it("两个部署 job 都必须显式声明 TARGET_ENV 和 HEALTH_URL", () => {
+  it("两个部署 job 都必须显式声明 TARGET_ENV 和 HEALTH_URL(drill 参数化后按场景 resolve)", () => {
     // HEALTH_URL 显式化,是为了让 deploy.sh 能拿它跟 wrangler 的输出**对账**。
     // v6 从 wrangler 输出里 grep URL,第二条正则会匹配到 warning 里的
     // https://developers.cloudflare.com/... ⇒ 冒烟测试打 Cloudflare 文档站 ⇒ 200 ⇒ 绿。
-    const expected: Record<string, string> = {
-      "deploy-staging": "staging",
-      "deploy-production": "production",
-    };
-    for (const [j, env] of Object.entries(expected)) {
-      expect(job(j).env?.TARGET_ENV, `${j} 缺 TARGET_ENV`).toBe(env);
-      const url = job(j).env?.HEALTH_URL ?? "";
-      expect(url, `${j} 缺 HEALTH_URL`).toMatch(/^https:\/\/\S+\/health$/);
-      expect(url, `${j} 的 HEALTH_URL 里没有 '${env}'`).toContain(env);
-    }
+    //
+    // drill 参数化后:deploy-staging 仍是字面量(drill 会跳过它);deploy-production
+    // 的 TARGET_ENV/HEALTH_URL 是 ${{ }} 表达式 ⇒ 按场景 resolve 后比字面量。
+    // staging 侧:仍是字面量
+    expect(job("deploy-staging").env?.TARGET_ENV, "deploy-staging 缺 TARGET_ENV").toBe("staging");
+    const stgUrl = job("deploy-staging").env?.HEALTH_URL ?? "";
+    expect(stgUrl, "deploy-staging 缺 HEALTH_URL").toMatch(/^https:\/\/\S+\/health$/);
+    expect(stgUrl, "deploy-staging 的 HEALTH_URL 里没有 staging").toContain("staging");
+    // production 侧:push→production、drill→drill
+    const dp = job("deploy-production");
+    expect(resolveExpr(dp.env?.TARGET_ENV ?? "", SC.push), "push 场景 TARGET_ENV 应为 production").toBe("production");
+    expect(resolveExpr(dp.env?.TARGET_ENV ?? "", SC.drill_deploy), "drill 场景 TARGET_ENV 应为 drill").toBe("drill");
+    const dpUrlPush = resolveExpr(dp.env?.HEALTH_URL ?? "", SC.push) as string;
+    const dpUrlDrill = resolveExpr(dp.env?.HEALTH_URL ?? "", SC.drill_deploy) as string;
+    expect(dpUrlPush, "push 场景 HEALTH_URL 格式").toMatch(/^https:\/\/\S+\/health$/);
+    expect(dpUrlPush, "push 场景 HEALTH_URL 应含 production").toContain("production");
+    expect(dpUrlDrill, "drill 场景 HEALTH_URL 应含 drill").toContain("drill");
+    // 决策 3:DEPLOY_VAR_OVERRIDE 仅 drill+显式时透传,prod 恒空
+    expect(resolveExpr(dp.env?.DEPLOY_VAR_OVERRIDE ?? "", SC.push), "push override 应为空").toBe("");
+    expect(resolveExpr(dp.env?.DEPLOY_VAR_OVERRIDE ?? "", SC.drill_deploy_E), "drill E override").toBe("HEALTH_MODE:broken");
   });
 
   it("⛔ deploy.yml 里一行 JSON 都不许构造 —— 全部走 scripts/emit.sh", () => {
@@ -264,14 +372,25 @@ describe("⑤ 出生 / 锁 / 破窗", () => {
     expect(iLock, "preflight 缺锁检查").toBeGreaterThan(iBirth);
   });
 
-  it("rollback job 必须有确认字面量,且不走 preflight 的锁", () => {
+  it("rollback job 确认字面量即目标选择器(prod=YES_ROLLBACK / drill=YES_ROLLBACK_DRILL),且不走 preflight 的锁", () => {
     const guard = job("rollback").if ?? "";
-    expect(guard).toContain("YES_ROLLBACK");
+    // 决策 2:job 只接受这两个字面量之一;下面 environment/组/TARGET_ENV 全由命中哪个决定。
+    expect(resolveExpr(guard, SC.prod_rb, true), "prod 破窗字面量应放行").toBe(true);
+    expect(resolveExpr(guard, SC.drill_rb, true), "drill 演练字面量应放行").toBe(true);
+    expect(resolveExpr(guard, SC.bogus_rb, true), "错误字面量必须挡住").toBe(false);
+    expect(resolveExpr(guard, SC.push, true), "push 不该触发 rollback").toBe(false);
     expect(job("rollback").needs, "破窗通道不能 needs preflight —— 锁挡住破窗 = 破窗不存在").toBeUndefined();
   });
 
-  it("rollback 与 deploy-production 同并发组且 cancel-in-progress —— 抢占正在跑的 prod 部署", () => {
-    expect(job("rollback").concurrency?.group).toBe(job("deploy-production").concurrency?.group);
+  it("rollback 与 deploy-production 同并发组(按场景 resolve)且 cancel-in-progress —— 抢占正在跑的部署", () => {
+    // 决策 2 后:deploy-production 的组按 target_env 选、rollback 的组按 confirm 字面量选 ——
+    // 两个表达式字符串**不同**,不能直接比字符串;必须比 resolve 后的组:
+    //   prod 场景两者都 → production-deploy;drill 场景两者都 → drill-deploy。
+    // ⇒ 抢占在各自 target 内成立,且 drill 回滚用 drill-deploy 组,抢不到在飞的 prod 部署。
+    expect(grp(job("rollback"), SC.prod_rb), "prod:rollback 组").toBe("production-deploy");
+    expect(grp(job("deploy-production"), SC.push), "prod:deploy-production 组").toBe("production-deploy");
+    expect(grp(job("rollback"), SC.drill_rb), "drill:rollback 组").toBe("drill-deploy");
+    expect(grp(job("deploy-production"), SC.drill_deploy), "drill:deploy-production 组").toBe("drill-deploy");
     expect(job("rollback").concurrency?.["cancel-in-progress"]).toBe(true);
   });
 
@@ -293,20 +412,27 @@ describe("⑤ 出生 / 锁 / 破窗", () => {
     expect((WF as unknown as Record<string, unknown>).concurrency).toBeUndefined();
   });
 
-  it("production-deploy 组恰好 2 个成员:deploy-production + rollback", () => {
-    const members = Object.entries(WF.jobs)
-      .filter(([, j]) => j.concurrency?.group === "production-deploy")
-      .map(([n]) => n)
-      .sort();
-    expect(members).toEqual(["deploy-production", "rollback"]);
+  it("production-deploy / drill-deploy 组各恰好 2 个成员:deploy-production + rollback(按场景 resolve)", () => {
+    // 组名参数化后不能按字符串 filter;按场景 resolve 每个 job 的组再看成员。
+    // rollback 用其 confirm 场景,其余 job 用 deploy 场景。
+    const membersIn = (group: string, dpCtx: Ctx, rbCtx: Ctx): string[] =>
+      Object.keys(WF.jobs)
+        .filter((n) => grp(WF.jobs[n], n === "rollback" ? rbCtx : dpCtx) === group)
+        .sort();
+    expect(membersIn("production-deploy", SC.push, SC.prod_rb)).toEqual(["deploy-production", "rollback"]);
+    expect(membersIn("drill-deploy", SC.drill_deploy, SC.drill_rb)).toEqual(["deploy-production", "rollback"]);
   });
 
-  it("rollback 用独立 environment(production-rollback)", () => {
-    // ⚠️ 这个 environment 上**绝不能**有 required_reviewers —— 破窗通道被审批门挡住
-    //    = 破窗通道不存在。而那条约束在 git diff 里**完全不可见**(GitHub 服务端设置)⇒
-    //    只能靠 verify-system.sh 的 D 段查 API。这里只能保证它不是 'production'。
-    expect(job("rollback").environment).toBe("production-rollback");
-    expect(job("rollback").environment).not.toBe("production");
+  it("rollback environment 按 confirm 字面量选(prod→production-rollback / drill→drill-env-rollback)", () => {
+    // ⚠️ production-rollback **和** drill-env-rollback 上都**绝不能**有 required_reviewers ——
+    //    破窗通道被审批门挡住 = 破窗通道不存在。git diff 里完全不可见(GitHub 服务端设置)⇒
+    //    只能靠 verify-system.sh 的 D 段查 API(drill-env-rollback 也必须加进 D 段)。
+    //    这里只能保证:两个场景 resolve 出的 environment 都不是裸 'production'。
+    const env = job("rollback").environment ?? "";
+    expect(resolveExpr(env, SC.prod_rb), "prod 破窗 environment").toBe("production-rollback");
+    expect(resolveExpr(env, SC.drill_rb), "drill 演练 environment").toBe("drill-env-rollback");
+    expect(resolveExpr(env, SC.prod_rb)).not.toBe("production");
+    expect(resolveExpr(env, SC.drill_rb)).not.toBe("production");
   });
 });
 
@@ -347,14 +473,19 @@ describe("⑦ package.json —— workflow.spec.ts 必须真的在 CI 里跑", (
 
 // ═════════════════════════════════════════════════════════════════
 describe("⑧ 运行时文件系统事实 —— scripts/ 必须位于 checkout 之后", () => {
-  it("所有包含 scripts/ 的 run step 都必须在 checkout 之后执行", () => {
+  it("有 scripts/ 的 job 必须有 checkout,且每个 scripts/ step 都在 checkout 之后", () => {
     for (const [name, j] of Object.entries(WF.jobs)) {
       const stepsList = j.steps ?? [];
       const iCheckout = stepsList.findIndex((s) => (s.uses ?? "").includes("actions/checkout"));
+      const hasScripts = stepsList.some((s) => (s.run ?? "").includes("scripts/"));
 
-      // 如果 job 根本没 checkout，那它肯定跑不了 scripts/
-      if (iCheckout === -1) continue;
-
+      // 收紧:原先 `iCheckout===-1 continue` 是个**假阴性洞** —— 一个「有 scripts/ 却没
+      // checkout」的 job 会被静默跳过。而那正是 prod_started 127 那类 bug 的形状:
+      // step 引用 scripts/emit.sh 但盘上没有 ⇒ 127 ⇒ 死亡证明也 127 ⇒ 零事件。
+      if (iCheckout === -1) {
+        expect(hasScripts, `job=${name} 有 scripts/ step 却没有 checkout ⇒ 必 127`).toBe(false);
+        continue;
+      }
       for (const s of stepsList) {
         if ((s.run ?? "").includes("scripts/")) {
           const iScript = stepsList.indexOf(s);
@@ -365,5 +496,56 @@ describe("⑧ 运行时文件系统事实 —— scripts/ 必须位于 checkout 
         }
       }
     }
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════
+describe("⑨ drill 的 job 图 —— deploy-production 的 if fail-closed(决策 1)", () => {
+  const dpIf = (): string => job("deploy-production").if ?? "";
+  const dsIf = (): string => job("deploy-staging").if ?? "";
+
+  it("deploy-production 的 if 必须含 always() + staging-success 守卫 + drill 例外", () => {
+    // 这三者少一个都可能让 staging 失败却直通 prod。
+    const g = dpIf();
+    expect(g, "缺 always()").toContain("always()");
+    expect(g, "缺 staging success 守卫").toContain("needs.deploy-staging.result == 'success'");
+    expect(g, "缺 drill 例外").toContain("github.event.inputs.target_env == 'drill'");
+  });
+
+  it("push/控制面部署时 staging 失败 ⇒ prod **不跑**(核心安全属性)", () => {
+    expect(resolveExpr(dpIf(), SC.push, true), "push+staging成功→跑").toBe(true);
+    expect(resolveExpr(dpIf(), SC.push_stg_fail, true), "push+staging失败→不跑").toBe(false);
+    // 不 gate event_name ⇒ 控制面 workflow_dispatch 部署照跑(否则会被误挡)
+    expect(resolveExpr(dpIf(), SC.ctrl_deploy, true), "控制面部署→跑").toBe(true);
+    // drill:staging 被跳过(result=skipped),但 always() + drill 例外让 prod 仍跑
+    expect(resolveExpr(dpIf(), SC.drill_deploy, true), "drill→跑").toBe(true);
+  });
+
+  it("deploy-staging:push 跑、drill 跳过", () => {
+    expect(resolveExpr(dsIf(), SC.push, true), "push→跑 staging").toBe(true);
+    expect(resolveExpr(dsIf(), SC.drill_deploy, true), "drill→跳过 staging").toBe(false);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════
+describe("⑩ push 不可达 drill —— push 场景所有 target 字段 resolve 都无 'drill'", () => {
+  it("deploy-production 在 push 场景 resolve 出的都是 prod 值,绝无 drill", () => {
+    const dp = job("deploy-production");
+    for (const f of ["TARGET_ENV", "HEALTH_URL", "DEPLOY_VAR_OVERRIDE"]) {
+      const v = resolveExpr(dp.env?.[f] ?? "", SC.push) as string;
+      expect(v.includes("drill"), `push 场景 ${f} 含 drill`).toBe(false);
+    }
+    expect((resolveExpr(dp.environment ?? "", SC.push) as string).includes("drill"), "push environment 含 drill").toBe(false);
+    expect(grp(dp, SC.push), "push 组应为 production-deploy").toBe("production-deploy");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════
+describe("⑪ drill 字面量不可选 prod —— YES_ROLLBACK_DRILL resolve 出的都是 drill 值", () => {
+  it("rollback 在 drill 字面量场景下 environment/TARGET_ENV/组 都无 'production'", () => {
+    const rb = job("rollback");
+    expect((resolveExpr(rb.environment ?? "", SC.drill_rb) as string).includes("production"), "drill environment 含 production").toBe(false);
+    expect((resolveExpr(rb.env?.TARGET_ENV ?? "", SC.drill_rb) as string).includes("production"), "drill TARGET_ENV 含 production").toBe(false);
+    expect((grp(rb, SC.drill_rb) ?? "").includes("production"), "drill 组含 production").toBe(false);
   });
 });

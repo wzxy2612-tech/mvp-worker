@@ -54,6 +54,25 @@
         "APP_VERSION": "v1-prod", // 生產環境正式版本標籤
         "HEALTH_MODE": "ok"       // 生產環境下，index.ts 會無視 broken 注入，確保安全
       }
+    },
+
+    // ==========================================================
+    // 3. Drill 演练环境（专供 E/F/G/H 演练；push 永远打不到这里）
+    //    ENVIRONMENT="drill" ≠ "production" ⇒ index.ts 的
+    //    `HEALTH_MODE==='broken' && ENVIRONMENT!=='production'` 门放行
+    //    ⇒ 演练 E 可由 deploy.sh 的 --var 把 HEALTH_MODE 覆盖成 broken，令 /health 返 500。
+    //    共用同一 CONFIG_KV：演练脚本均不写 KV，/health 也豁免 maintenance-mode 读，故无害。
+    // ==========================================================
+    "drill": {
+      "name": "mvp-worker-drill",
+      "kv_namespaces": [
+        { "binding": "CONFIG_KV", "id": "7cb1358101494bc2baf36a1275301202" }
+      ],
+      "vars": {
+        "ENVIRONMENT": "drill",
+        "APP_VERSION": "v1-drill",
+        "HEALTH_MODE": "ok"
+      }
     }
   }
 }

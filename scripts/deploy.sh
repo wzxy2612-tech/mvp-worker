@@ -39,18 +39,42 @@ source "$SCRIPT_DIR/utils.sh"
 #    v6 的 `${CLOUDFLARE_ENV:-staging}` 会:部到 dev,然后汇报「staging 的 gate_passed」。
 require_env TARGET_ENV HEALTH_URL || exit 1
 
-# 显式 --env,和 rollback.sh 用同一个机制。
+# ─────────────────────────────────────────────────────────────
+# 决策 3 —— 可选 --var 注入(仅演练用)+ 生产结构性堵死
 #
-# ⚠️ 刻意**不**用环境变量 CLOUDFLARE_ENV 那条隐式通道。
+# DEPLOY_VAR_OVERRIDE 形如 "HEALTH_MODE:broken"。演练 E 用它给 drill-env 注入坏健康,
+# 让 /health 返 500 → 健康门挂 → 触发 deploy-production 的自动回滚守卫。
+#
+# ⛔ 结构性 fail-closed:TARGET_ENV==production 一律**忽略**该变量并大声说出来。
+#    注入能力在生产上**物理堵死** —— 无论 deploy.yml 那层是否漏、无论谁手动设了它。
+#    这是三层独立防御的第二层:
+#      1) deploy.yml 只在 target_env=='drill' 时才把 override 透传进来(恒为空 on prod)
+#      2) 本处:即便传进来了,production 也忽略
+#      3) index.ts 的 `ENVIRONMENT!=='production'` 门:即便 broken 真进了 prod,/health 仍返 200
+#
+# ⚠️ 不用环境变量 CLOUDFLARE_ENV 那条隐式通道。
 #    v6:deploy.sh 走隐式 CLOUDFLARE_ENV,rollback.sh 走显式 --env —— 两个机制。
 #    wrangler 刚 4.108 → 4.110。隐式路径一旦回归:
 #      deploy 打到顶层 mvp-worker-dev、打印 dev 的 URL、冒烟 dev、报 deploy_ok,
 #      而 rollback.sh 依然正确地回滚 **production**。**部署到 dev,回滚 prod。**
 #    现在 wrangler 只可能看见 --env。一个机制,不可能漂移。
-log_info "wrangler deploy --env ${TARGET_ENV}"
+# ─────────────────────────────────────────────────────────────
+WR_ARGS=(deploy --env "$TARGET_ENV")
+
+if [ -n "${DEPLOY_VAR_OVERRIDE:-}" ]; then
+  if [ "$TARGET_ENV" = "production" ]; then
+    log_error "⛔ 忽略 DEPLOY_VAR_OVERRIDE='${DEPLOY_VAR_OVERRIDE}' —— 生产禁止 --var 注入(结构性堵死)。"
+    echo "::warning title=注入被拒::生产部署忽略 DEPLOY_VAR_OVERRIDE,仅 drill 可用。"
+  else
+    log_info "注入 wrangler --var:${DEPLOY_VAR_OVERRIDE}(仅 ${TARGET_ENV})"
+    WR_ARGS+=(--var "$DEPLOY_VAR_OVERRIDE")
+  fi
+fi
+
+log_info "wrangler ${WR_ARGS[*]}"
 
 set +e
-DEPLOY_OUTPUT=$(npx wrangler deploy --env "$TARGET_ENV" 2>&1)
+DEPLOY_OUTPUT=$(npx wrangler "${WR_ARGS[@]}" 2>&1)
 DEPLOY_RC=$?
 set -e
 
@@ -81,6 +105,8 @@ fi
 #
 # 现在:HEALTH_URL 是唯一权威;wrangler 的输出只用来**证伪**它。
 # URL 猜错 ⇒ 这里硬失败 ⇒ staging 红 ⇒ 什么都不会 ship。**fail-closed on 我的猜测。**
+#
+# 注:--var 只改运行时变量,不改 worker 名/URL ⇒ 注入不影响本对账(HEALTH_HOST 仍在输出里)。
 # ─────────────────────────────────────────────────────────────
 HEALTH_HOST=$(printf '%s' "$HEALTH_URL" | sed -E 's#^https?://([^/]+).*#\1#')
 
