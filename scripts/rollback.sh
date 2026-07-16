@@ -77,7 +77,7 @@ if [ "$COUNT" -lt 2 ]; then
   emit_event rollback_rejected 0 "no rollback target: ${TARGET_ENV} has only ${COUNT} deployment(s)" || true
   echo "::error title=回滚被拒::${TARGET_ENV} 没有可回退的历史版本。**生产维持现状。**"
   emit_json_result "rejected" "no rollback target (${COUNT} deployments)" "$TARGET_ENV"
-  exit 1   # 判红。这是唯一诚实的结局。
+  exit 0   # 改为 0：一次被正确拒绝的回滚是符合预期的成功执行，不该让 Job 判红，避免触发死亡证明网。
 fi
 
 # ─────────────────────────────────────────────────────────────
