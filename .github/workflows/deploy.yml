@@ -241,6 +241,10 @@ jobs:
       # 决策 3:注入仅在「drill 且显式给了 override」时透传;prod 路径恒为空
       # (deploy.sh 再忽略一层,index.ts 的 ENVIRONMENT!=='production' 门是第三层)。
       DEPLOY_VAR_OVERRIDE: ${{ github.event.inputs.target_env == 'drill' && github.event.inputs.deploy_var_override || '' }}
+      # 终点旗标:drill 是一次性部署(无后续晋级)⇒ 声明为终点 ⇒ health-gate.sh 发 deploy_ok
+      # (硬终态,释放锁),而非 gate_passed(卡在 gate_waiting 攥着锁)。
+      # push 时恒空,但 health-gate.sh 的 TARGET_ENV==production 分支照样发 deploy_ok。
+      TERMINAL_DEPLOY: ${{ github.event.inputs.target_env == 'drill' && '1' || '' }}
     steps:
       # 审批可能搁置任意久。这段时间里可能发生:紧急回滚(→ superseded)、
       # reaper 超时(→ timed_out)、有人 Re-run 了这个 run(→ 硬终态已在库)。
